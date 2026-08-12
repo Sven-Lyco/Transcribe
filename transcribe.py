@@ -17,9 +17,12 @@ import os
 import sys
 import tempfile
 import threading
+import time
+import uuid
 import webbrowser
 import glob
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 PORT = 8765
 
@@ -58,6 +61,27 @@ ffmpeg_found = find_and_add_ffmpeg()
 # Prüfe ob whisper installiert ist
 try:
     import whisper
+    import tqdm as _tqdm_module
+
+    _jobs: dict = {}
+    _jobs_lock = threading.Lock()
+    _tqdm_local = threading.local()
+
+    _orig_tqdm = _tqdm_module.tqdm
+
+    class _ProgressTqdm(_orig_tqdm):
+        def update(self, n=1):
+            result = super().update(n)
+            job_id = getattr(_tqdm_local, "job_id", None)
+            if job_id and self.total and self.total > 0:
+                pct = min(99, int(self.n / self.total * 100))
+                with _jobs_lock:
+                    if job_id in _jobs:
+                        _jobs[job_id]["progress"] = pct
+            return result
+
+    _tqdm_module.tqdm = _ProgressTqdm
+
 except ImportError:
     print("=" * 50)
     print("Whisper ist nicht installiert.")
@@ -331,6 +355,22 @@ HTML = """<!DOCTYPE html>
     font-family: 'IBM Plex Mono', monospace;
   }
 
+  .prog-bar {
+    margin-top: 0.75rem;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    display: none;
+  }
+
+  .prog-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.4s ease;
+  }
+
   .spinner {
     display: inline-block;
     width: 10px;
@@ -394,6 +434,7 @@ HTML = """<!DOCTYPE html>
   <div class="status" id="status">
     <div class="progress" id="statusText"><span class="spinner"></span> Wird verarbeitet...</div>
     <div id="statusDetail"></div>
+    <div class="prog-bar" id="progBar"><div class="prog-fill" id="progFill"></div></div>
   </div>
 
   <div class="result" id="result">
@@ -413,6 +454,8 @@ HTML = """<!DOCTYPE html>
   const status = document.getElementById('status');
   const statusText = document.getElementById('statusText');
   const statusDetail = document.getElementById('statusDetail');
+  const progBar = document.getElementById('progBar');
+  const progFill = document.getElementById('progFill');
   const result = document.getElementById('result');
   const transcript = document.getElementById('transcript');
   const copyBtn = document.getElementById('copyBtn');
@@ -471,6 +514,8 @@ HTML = """<!DOCTYPE html>
     status.classList.add('visible');
     statusText.innerHTML = '<span class="spinner"></span> Datei wird übertragen...';
     statusDetail.textContent = '';
+    progFill.style.width = '0%';
+    progBar.style.display = 'none';
     result.classList.remove('visible');
 
     const formData = new FormData();
@@ -481,14 +526,7 @@ HTML = """<!DOCTYPE html>
     formData.append('output_folder', outputFolderInput.value.trim());
 
     try {
-      statusText.innerHTML = '<span class="spinner"></span> Modell wird geladen & Transkription läuft...';
-      statusDetail.textContent = 'Das kann beim ersten Mal 1–2 Minuten dauern (Modell-Download).';
-
-      const response = await fetch('/transcribe', {
-        method: 'POST',
-        body: formData
-      });
-
+      const response = await fetch('/transcribe', { method: 'POST', body: formData });
       const data = await response.json();
 
       if (data.error) {
@@ -498,17 +536,48 @@ HTML = """<!DOCTYPE html>
         return;
       }
 
-      statusText.innerHTML = '✅ Fertig';
-      statusDetail.textContent = `Sprache erkannt: ${data.language} · Dauer: ${data.duration}s · Gespeichert als: ${data.saved_as}`;
-      transcript.value = data.text;
-      result.classList.add('visible');
+      statusText.innerHTML = '<span class="spinner"></span> Modell wird geladen & Transkription läuft...';
+      statusDetail.textContent = 'Das kann beim ersten Mal 1–2 Minuten dauern (Modell-Download).';
+      progBar.style.display = 'block';
+
+      const es = new EventSource(`/progress?job=${data.job_id}`);
+
+      es.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'progress') {
+          progFill.style.width = msg.value + '%';
+          if (msg.value > 0) statusDetail.textContent = `Fortschritt: ${msg.value}%`;
+        } else if (msg.type === 'done') {
+          es.close();
+          progFill.style.width = '100%';
+          statusText.innerHTML = '✅ Fertig';
+          statusDetail.textContent = `Sprache erkannt: ${msg.language} · Dauer: ${msg.duration}s · Gespeichert als: ${msg.saved_as}`;
+          transcript.value = msg.text;
+          result.classList.add('visible');
+          startBtn.disabled = false;
+        } else if (msg.type === 'error') {
+          es.close();
+          statusText.innerHTML = '❌ Fehler';
+          statusDetail.textContent = msg.message;
+          progBar.style.display = 'none';
+          startBtn.disabled = false;
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        statusText.innerHTML = '❌ Verbindungsfehler';
+        statusDetail.textContent = 'Verbindung zum Server unterbrochen.';
+        progBar.style.display = 'none';
+        startBtn.disabled = false;
+      };
 
     } catch (err) {
       statusText.innerHTML = '❌ Verbindungsfehler';
       statusDetail.textContent = err.message;
+      progBar.style.display = 'none';
+      startBtn.disabled = false;
     }
-
-    startBtn.disabled = false;
   });
 
   copyBtn.addEventListener('click', () => {
@@ -521,11 +590,124 @@ HTML = """<!DOCTYPE html>
 </html>"""
 
 
+def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, output_folder, file_name):
+    _tqdm_local.job_id = job_id
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+        print(f"  → Lade Modell '{model_name}'...")
+        model = whisper.load_model(model_name, device=device)
+
+        print(f"  → Transkribiere '{file_name}'...")
+        kwargs = {"verbose": False}
+        if language != "auto":
+            kwargs["language"] = language
+
+        result = model.transcribe(tmp_path, fp16=(device != "cpu"), **kwargs)
+        text = result["text"].strip()
+        lang = result.get("language", "?")
+
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", tmp_path],
+                capture_output=True, text=True
+            )
+            duration = round(float(r.stdout.strip()))
+        except Exception:
+            duration = "?"
+
+        if output_folder and Path(output_folder).is_dir():
+            save_dir = Path(output_folder)
+        else:
+            save_dir = Path(__file__).parent / "transcriptions"
+            save_dir.mkdir(exist_ok=True)
+
+        import re
+        ts_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+at\s+(\d{2}\.\d{2}\.\d{2})', file_name)
+        timestamp = f"{ts_match.group(1)} - {ts_match.group(2)}" if ts_match else None
+
+        if timestamp and speaker_name:
+            prefix = f"{timestamp} - {speaker_name}"
+        elif timestamp:
+            prefix = timestamp
+        elif speaker_name:
+            prefix = speaker_name
+        else:
+            prefix = None
+
+        formatted_text = f"{prefix}: {text}" if prefix else text
+        txt_name = Path(file_name).stem + ".txt"
+        txt_path = save_dir / txt_name
+        txt_path.write_text(formatted_text, encoding="utf-8")
+        print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
+
+        with _jobs_lock:
+            _jobs[job_id]["progress"] = 100
+            _jobs[job_id]["done"] = True
+            _jobs[job_id]["result"] = {
+                "text": formatted_text,
+                "language": lang,
+                "duration": duration,
+                "saved_as": str(txt_path),
+            }
+    except Exception as e:
+        with _jobs_lock:
+            _jobs[job_id]["done"] = True
+            _jobs[job_id]["error"] = str(e)
+    finally:
+        os.unlink(tmp_path)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Stille Logs
 
     def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/progress":
+            job_id = parse_qs(parsed.query).get("job", [None])[0]
+            if not job_id:
+                self.send_response(400)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                while True:
+                    with _jobs_lock:
+                        job = _jobs.get(job_id, {}).copy()
+                    if not job:
+                        break
+                    if job.get("done"):
+                        if job.get("error"):
+                            payload = json.dumps({"type": "error", "message": job["error"]})
+                        else:
+                            payload = json.dumps({"type": "done", **job["result"]})
+                        self.wfile.write(f"data: {payload}\n\n".encode())
+                        self.wfile.flush()
+                        with _jobs_lock:
+                            _jobs.pop(job_id, None)
+                        break
+                    else:
+                        payload = json.dumps({"type": "progress", "value": job.get("progress", 0)})
+                        self.wfile.write(f"data: {payload}\n\n".encode())
+                        self.wfile.flush()
+                    time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
@@ -576,56 +758,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_response({"error": "Keine Datei empfangen."})
             return
 
-        # Temporäre Datei
         suffix = Path(file_name).suffix or ".ogg"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
 
-        try:
-            print(f"  → Lade Modell '{model_name}'...")
-            model = whisper.load_model(model_name)
+        job_id = str(uuid.uuid4())
+        with _jobs_lock:
+            _jobs[job_id] = {"progress": 0, "done": False, "result": None, "error": None}
 
-            print(f"  → Transkribiere '{file_name}'...")
-            kwargs = {}
-            if language != "auto":
-                kwargs["language"] = language
+        threading.Thread(
+            target=_run_transcription,
+            args=(job_id, model_name, tmp_path, language, speaker_name, output_folder, file_name),
+            daemon=True,
+        ).start()
 
-            result = model.transcribe(tmp_path, **kwargs)
-            text = result["text"].strip()
-            lang = result.get("language", "?")
-
-            import subprocess
-            try:
-                r = subprocess.run(
-                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", tmp_path],
-                    capture_output=True, text=True
-                )
-                duration = round(float(r.stdout.strip()))
-            except Exception:
-                duration = "?"
-
-            # Ausgabeordner bestimmen
-            if output_folder and Path(output_folder).is_dir():
-                save_dir = Path(output_folder)
-            else:
-                save_dir = Path(__file__).parent / "transcriptions"
-                save_dir.mkdir(exist_ok=True)
-
-            # Text mit Name formatieren
-            formatted_text = f"{speaker_name}: {text}" if speaker_name else text
-
-            txt_name = Path(file_name).stem + ".txt"
-            txt_path = save_dir / txt_name
-            txt_path.write_text(formatted_text, encoding="utf-8")
-            print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
-            self._json_response({"text": formatted_text, "language": lang, "duration": duration, "saved_as": str(txt_path)})
-
-        except Exception as e:
-            self._json_response({"error": str(e)})
-        finally:
-            os.unlink(tmp_path)
+        self._json_response({"job_id": job_id})
 
     def _json_response(self, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -642,12 +790,13 @@ def main():
     print("=" * 50)
     print(f"  Server läuft auf http://localhost:{PORT}")
     print("  Browser öffnet sich automatisch...")
-    print("  Zum Beenden: Strg+C")
+    stop_key = "Strg+C" if sys.platform == "win32" else "Ctrl+C"
+    print(f"  Zum Beenden: {stop_key}")
     print("=" * 50)
 
     threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
 
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    with socketserver.ThreadingTCPServer(("", PORT), Handler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
