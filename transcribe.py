@@ -23,9 +23,21 @@ from pathlib import Path
 
 PORT = 8765
 
-# ffmpeg automatisch finden (vor allem für WinGet-Installationen)
+# ffmpeg automatisch finden (Windows WinGet + macOS Homebrew)
 def find_and_add_ffmpeg():
-    # Bekannte WinGet-Installationspfade
+    if sys.platform == "darwin":
+        candidates = [
+            "/opt/homebrew/bin",   # Apple Silicon
+            "/usr/local/bin",      # Intel Mac
+        ]
+        for path in candidates:
+            if Path(path, "ffmpeg").exists():
+                os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+                print(f"  ffmpeg gefunden: {path}")
+                return True
+        return False
+
+    # Windows: WinGet-Installationspfade
     winget_base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
     patterns = [
         str(winget_base / "Gyan.FFmpeg_*" / "ffmpeg-*" / "bin"),
@@ -375,7 +387,7 @@ HTML = """<!DOCTYPE html>
     </div>
     <div class="field">
       <label>Ausgabeordner</label>
-      <input type="text" id="outputFolder" placeholder="Pfad zum Zielordner (leer = neben Script)">
+      <input type="text" id="outputFolder" placeholder="Pfad zum Zielordner (leer = transcriptions/)">
     </div>
   </div>
 
@@ -525,7 +537,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        import cgi
         content_type = self.headers.get("Content-Type", "")
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -599,7 +610,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if output_folder and Path(output_folder).is_dir():
                 save_dir = Path(output_folder)
             else:
-                save_dir = Path(__file__).parent
+                save_dir = Path(__file__).parent / "transcriptions"
+                save_dir.mkdir(exist_ok=True)
 
             # Text mit Name formatieren
             formatted_text = f"{speaker_name}: {text}" if speaker_name else text
