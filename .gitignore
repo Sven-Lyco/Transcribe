@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Transcription output (local, may contain private content)
+transcriptions/*
+!transcriptions/.gitkeep
