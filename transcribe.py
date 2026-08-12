@@ -363,9 +363,9 @@ HTML = """<!DOCTYPE html>
       <label>Modell</label>
       <select id="model">
         <option value="tiny">tiny — schnell, ~39MB</option>
-        <option value="base" selected>base — gut, ~74MB</option>
+        <option value="base">base — gut, ~74MB</option>
         <option value="small">small — besser, ~244MB</option>
-        <option value="medium">medium — sehr gut, ~769MB</option>
+        <option value="medium" selected>medium — sehr gut, ~769MB</option>
       </select>
       <div class="model-hint" id="modelHint">Beim ersten Mal wird das Modell heruntergeladen.</div>
     </div>
