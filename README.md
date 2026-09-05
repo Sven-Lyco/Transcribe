@@ -15,10 +15,17 @@ A local, privacy-first audio transcription tool powered by [OpenAI Whisper](http
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+ (older versions still work, but recent security-patched releases of some dependencies no longer support Python 3.9 and earlier)
 - [ffmpeg](https://ffmpeg.org/) (for audio decoding)
 
 ## Setup & Usage
+
+Clone the repository first:
+
+```bash
+git clone https://github.com/Sven-Lyco/Transcribe.git
+cd Transcribe
+```
 
 ### macOS / Linux
 
@@ -39,6 +46,8 @@ transcribe.bat
 ### Manual
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install openai-whisper
 python transcribe.py
 ```
@@ -67,3 +76,7 @@ WhatsApp Audio 2026-08-12 at 09.49.50.ogg
 ```
 2026-08-12 - 09.49.50 - Speaker Name: Transcribed text appears here.
 ```
+
+## License
+
+[MIT](LICENSE)
