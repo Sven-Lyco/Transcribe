@@ -796,7 +796,7 @@ def main():
 
     threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
 
-    with socketserver.ThreadingTCPServer(("", PORT), Handler) as httpd:
+    with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
