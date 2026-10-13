@@ -7,13 +7,20 @@ Einmalige Installation (einmal ausführen):
 Danach einfach starten:
     python transcribe.py
 
-Öffnet dann automatisch http://localhost:8765 im Browser.
+Öffnet dann automatisch http://127.0.0.1:8765 im Browser.
+
+Anderer Port:
+    python transcribe.py --port 9000
 """
 
+import argparse
+import errno
 import http.server
 import socketserver
 import json
 import os
+import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -24,10 +31,25 @@ import glob
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-PORT = 8765
+HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+PORT_SUGGESTIONS = 3  # Anzahl freier Ports, die bei belegtem Port angeboten werden
+# Ports, die Browser nicht öffnen (ERR_UNSAFE_PORT)
+BROWSER_BLOCKED_PORTS = frozenset({
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
+    101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161,
+    179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563,
+    587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060,
+    5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+})
+MODELS = ("tiny", "base", "small", "medium")
+LANGUAGES = ("de", "en", "auto")
 
-# ffmpeg automatisch finden (Windows WinGet + macOS Homebrew)
+# ffmpeg automatisch finden (PATH, Windows WinGet + macOS Homebrew)
 def find_and_add_ffmpeg():
+    if shutil.which("ffmpeg"):
+        return True
+
     if sys.platform == "darwin":
         candidates = [
             "/opt/homebrew/bin",   # Apple Silicon
@@ -38,6 +60,9 @@ def find_and_add_ffmpeg():
                 os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
                 print(f"  ffmpeg gefunden: {path}")
                 return True
+        return False
+
+    if sys.platform != "win32":
         return False
 
     # Windows: WinGet-Installationspfade
@@ -56,16 +81,27 @@ def find_and_add_ffmpeg():
                 return True
     return False
 
-ffmpeg_found = find_and_add_ffmpeg()
 
-# Prüfe ob whisper installiert ist
-try:
-    import whisper
-    import tqdm as _tqdm_module
+whisper = None  # wird erst in load_whisper() importiert, damit --help nicht auf den Import wartet
 
-    _jobs: dict = {}
-    _jobs_lock = threading.Lock()
-    _tqdm_local = threading.local()
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+_tqdm_local = threading.local()
+
+
+def load_whisper():
+    """Importiert Whisper und leitet dessen Fortschrittsbalken an den laufenden Job weiter."""
+    global whisper
+    try:
+        import whisper
+        import tqdm as _tqdm_module
+    except ImportError:
+        print("=" * 50)
+        print("Whisper ist nicht installiert.")
+        print("Bitte einmalig ausführen:")
+        print("    pip install openai-whisper")
+        print("=" * 50)
+        sys.exit(1)
 
     _orig_tqdm = _tqdm_module.tqdm
 
@@ -82,13 +118,6 @@ try:
 
     _tqdm_module.tqdm = _ProgressTqdm
 
-except ImportError:
-    print("=" * 50)
-    print("Whisper ist nicht installiert.")
-    print("Bitte einmalig ausführen:")
-    print("    pip install openai-whisper")
-    print("=" * 50)
-    sys.exit(1)
 
 HTML = """<!DOCTYPE html>
 <html lang="de">
@@ -97,9 +126,9 @@ HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Whisper Transkription</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
-
   :root {
+    --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
     --bg: #0f0f0f;
     --surface: #1a1a1a;
     --border: #2a2a2a;
@@ -114,7 +143,7 @@ HTML = """<!DOCTYPE html>
   body {
     background: var(--bg);
     color: var(--text);
-    font-family: 'IBM Plex Sans', sans-serif;
+    font-family: var(--sans);
     font-weight: 300;
     min-height: 100vh;
     display: flex;
@@ -130,7 +159,7 @@ HTML = """<!DOCTYPE html>
   }
 
   h1 {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
     font-size: 1.1rem;
     font-weight: 600;
     color: var(--accent);
@@ -143,7 +172,7 @@ HTML = """<!DOCTYPE html>
     color: var(--muted);
     font-size: 0.85rem;
     margin-bottom: 2.5rem;
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
   }
 
   .drop-zone {
@@ -191,7 +220,7 @@ HTML = """<!DOCTYPE html>
     margin-top: 0.75rem;
     font-size: 0.8rem;
     color: var(--accent);
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
   }
 
   .settings {
@@ -211,7 +240,7 @@ HTML = """<!DOCTYPE html>
   label {
     font-size: 0.75rem;
     color: var(--muted);
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
@@ -222,7 +251,7 @@ HTML = """<!DOCTYPE html>
     color: var(--text);
     padding: 0.6rem 0.75rem;
     border-radius: var(--radius);
-    font-family: 'IBM Plex Sans', sans-serif;
+    font-family: var(--sans);
     font-size: 0.9rem;
     appearance: none;
     cursor: pointer;
@@ -240,7 +269,7 @@ HTML = """<!DOCTYPE html>
     color: var(--text);
     padding: 0.6rem 0.75rem;
     border-radius: var(--radius);
-    font-family: 'IBM Plex Sans', sans-serif;
+    font-family: var(--sans);
     font-size: 0.9rem;
     transition: border-color 0.2s;
     width: 100%;
@@ -261,7 +290,7 @@ HTML = """<!DOCTYPE html>
     border: none;
     padding: 0.65rem 1.5rem;
     border-radius: var(--radius);
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
     font-weight: 600;
     font-size: 0.85rem;
     cursor: pointer;
@@ -280,7 +309,7 @@ HTML = """<!DOCTYPE html>
     background: var(--surface);
     border-left: 3px solid var(--accent);
     border-radius: 0 var(--radius) var(--radius) 0;
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
     font-size: 0.82rem;
     color: var(--text);
     display: none;
@@ -308,7 +337,7 @@ HTML = """<!DOCTYPE html>
   }
 
   .result-label {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
     font-size: 0.75rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -336,7 +365,7 @@ HTML = """<!DOCTYPE html>
     color: var(--text);
     padding: 1rem;
     border-radius: var(--radius);
-    font-family: 'IBM Plex Sans', sans-serif;
+    font-family: var(--sans);
     font-size: 0.9rem;
     line-height: 1.6;
     resize: vertical;
@@ -352,7 +381,7 @@ HTML = """<!DOCTYPE html>
     margin-top: 0.4rem;
     font-size: 0.75rem;
     color: var(--muted);
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--mono);
   }
 
   .prog-bar {
@@ -402,10 +431,10 @@ HTML = """<!DOCTYPE html>
     <div class="field">
       <label>Modell</label>
       <select id="model">
-        <option value="tiny">tiny — schnell, ~39MB</option>
-        <option value="base">base — gut, ~74MB</option>
-        <option value="small">small — besser, ~244MB</option>
-        <option value="medium" selected>medium — sehr gut, ~769MB</option>
+        <option value="tiny">tiny — schnell, ~75 MB</option>
+        <option value="base">base — gut, ~140 MB</option>
+        <option value="small">small — besser, ~460 MB</option>
+        <option value="medium" selected>medium — sehr gut, ~1,4 GB</option>
       </select>
       <div class="model-hint" id="modelHint">Beim ersten Mal wird das Modell heruntergeladen.</div>
     </div>
@@ -670,7 +699,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Stille Logs
 
+    def _is_local_request(self):
+        """Lässt nur Anfragen der eigenen Seite zu, nicht die fremder Webseiten im selben Browser."""
+        port = self.server.server_address[1]
+        names = ("127.0.0.1", "localhost")
+        hosts = {f"{name}:{port}" for name in names}
+        if port == 80:
+            hosts.update(names)
+        if self.headers.get("Host") not in hosts:
+            return False
+        origin = self.headers.get("Origin")
+        return origin is None or origin in {f"http://{host}" for host in hosts}
+
     def do_GET(self):
+        if not self._is_local_request():
+            self.send_error(403)
+            return
+
         parsed = urlparse(self.path)
         if parsed.path == "/progress":
             job_id = parse_qs(parsed.query).get("job", [None])[0]
@@ -706,6 +751,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     time.sleep(0.5)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            self.close_connection = True  # Stream ist zu Ende, nicht auf weitere Anfragen warten
             return
 
         self.send_response(200)
@@ -714,6 +760,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(HTML.encode("utf-8"))
 
     def do_POST(self):
+        if not self._is_local_request():
+            self.send_error(403)
+            return
+
         if self.path != "/transcribe":
             self.send_response(404)
             self.end_headers()
@@ -738,7 +788,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if b"Content-Disposition" not in part:
                 continue
             header, _, content = part.partition(b"\r\n\r\n")
-            content = content.rstrip(b"\r\n")
+            if content.endswith(b"\r\n"):
+                content = content[:-2]
             header_str = header.decode("utf-8", errors="ignore")
 
             if 'name="file"' in header_str:
@@ -757,6 +808,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not file_data:
             self._json_response({"error": "Keine Datei empfangen."})
             return
+
+        if model_name not in MODELS:
+            self._json_response({"error": f"Unbekanntes Modell: {model_name}"})
+            return
+
+        if language not in LANGUAGES:
+            self._json_response({"error": f"Unbekannte Sprache: {language}"})
+            return
+
+        if output_folder:
+            output_dir = Path(output_folder).expanduser()
+            if not output_dir.is_dir():
+                self._json_response({"error": f"Ausgabeordner nicht gefunden: {output_folder}"})
+                return
+            output_folder = str(output_dir)
 
         suffix = Path(file_name).suffix or ".ogg"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -784,19 +850,148 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class Server(socketserver.ThreadingTCPServer):
+    daemon_threads = True  # Ctrl+C soll nicht auf offene Fortschritts-Streams warten
+
+
+def parse_port(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' ist keine Zahl")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("Port muss zwischen 1 und 65535 liegen")
+    if port in BROWSER_BLOCKED_PORTS:
+        raise argparse.ArgumentTypeError(f"Port {port} wird von Browsern blockiert")
+    return port
+
+
+def is_port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((HOST, port))
+        except OSError:
+            return False
+    return True
+
+
+def is_listening(port):
+    """Prüft, ob auf dem Port tatsächlich ein Programm Verbindungen annimmt."""
+    try:
+        with socket.create_connection((HOST, port), timeout=0.5):
+            return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        return True
+
+
+def find_free_ports(start, count=PORT_SUGGESTIONS):
+    """Liefert die nächsten freien Ports ab `start`."""
+    ports = []
+    for port in range(start, 65536):
+        if port not in BROWSER_BLOCKED_PORTS and is_port_free(port):
+            ports.append(port)
+            if len(ports) == count:
+                break
+    return ports
+
+
+def ask_port(busy_port):
+    """Bietet die nächsten freien Ports nach `busy_port` zur Auswahl an; eigene Eingabe ist auch möglich."""
+    suggestions = find_free_ports(busy_port + 1)
+    if suggestions:
+        print("  Freie Ports:")
+        for i, port in enumerate(suggestions, 1):
+            print(f"    [{i}] {port}")
+        prompt = f"  Auswahl oder eigener Port (Enter = {suggestions[0]}): "
+    else:
+        prompt = "  Anderen Port eingeben: "
+
+    while True:
+        try:
+            value = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+        if not value and suggestions:
+            return suggestions[0]
+        if value.isdecimal() and 1 <= int(value) <= len(suggestions):
+            return suggestions[int(value) - 1]
+        try:
+            return parse_port(value)
+        except argparse.ArgumentTypeError as e:
+            print(f"  Ungültige Eingabe: {e}")
+
+
+def bind_server(port):
+    """Bindet den Server an den Port. Wirft OSError, wenn das nicht möglich ist."""
+    try:
+        return Server((HOST, port), Handler)
+    except OSError as e:
+        # Kurz nach dem Beenden hält das System den Port noch fest, obwohl niemand mehr lauscht.
+        # Nur in diesem Fall mit SO_REUSEADDR erneut binden: Generell gesetzt würde es unter
+        # macOS einen fremden Listener auf *:port überdecken.
+        if e.errno != errno.EADDRINUSE or sys.platform == "win32" or is_listening(port):
+            raise
+
+    httpd = Server((HOST, port), Handler, bind_and_activate=False)
+    httpd.allow_reuse_address = True
+    try:
+        httpd.server_bind()
+        httpd.server_activate()
+    except OSError:
+        httpd.server_close()
+        raise
+    return httpd
+
+
+def create_server(port):
+    """Startet den Server. Ist der Port nicht verfügbar, wird nach einem anderen gefragt."""
+    while True:
+        try:
+            return bind_server(port)
+        except OSError as e:
+            if e.errno not in (errno.EADDRINUSE, errno.EACCES):
+                print(f"  Server konnte nicht gestartet werden: {e}")
+                sys.exit(1)
+            print(f"  Port {port} ist nicht verfügbar ({e.strerror}).")
+            if not (sys.stdin and sys.stdin.isatty()):
+                print("  Mit --port einen anderen Port angeben.")
+                sys.exit(1)
+            port = ask_port(port)
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Lokales Whisper Transkriptions-Tool")
+    parser.add_argument(
+        "-p", "--port", type=parse_port, default=DEFAULT_PORT,
+        help=f"Port für die Weboberfläche (Standard: {DEFAULT_PORT})",
+    )
+    args = parser.parse_args()
+
+    if not find_and_add_ffmpeg():
+        print("  Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.")
+        print("  Installation: brew install ffmpeg (macOS), winget install Gyan.FFmpeg (Windows),")
+        print("                sudo apt install ffmpeg (Linux)")
+
+    load_whisper()
+
+    httpd = create_server(args.port)
+    url = f"http://{HOST}:{httpd.server_address[1]}"
+
     print("=" * 50)
     print("  Whisper Transkriptions-Tool")
     print("=" * 50)
-    print(f"  Server läuft auf http://localhost:{PORT}")
+    print(f"  Server läuft auf {url}")
     print("  Browser öffnet sich automatisch...")
     stop_key = "Strg+C" if sys.platform == "win32" else "Ctrl+C"
     print(f"  Zum Beenden: {stop_key}")
     print("=" * 50)
 
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
-    with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
+    with httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

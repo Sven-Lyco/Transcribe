@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+.DS_Store
 
 # Transcription output (local, may contain private content)
 transcriptions/*
