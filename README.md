@@ -15,7 +15,7 @@ Transcribe is available as a Mac app for **Apple Silicon (M1 or newer) with macO
 3. Open Transcribe. The app is not signed by Apple, so macOS blocks it the first time ("Apple could not verify …"). Click **Done**, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to Transcribe. This is needed only once.
 4. Drop an audio file into the window.
 
-The first transcription downloads the Whisper model (about 1.6 GB). The history (`Verlauf`) in the window shows all transcriptions; each one is also saved as a `.txt` file. Settings (⚙︎) → `Ordner öffnen` shows these files in Finder.
+The first transcription downloads the Whisper model (about 1.5 GB). The history (`Verlauf`) in the window shows all transcriptions; each one is also saved as a `.txt` file. Settings (⚙︎) → `Ordner öffnen` shows these files in Finder.
 
 All app data lives in one folder, `~/Library/Application Support/Transcribe`:
 
@@ -135,20 +135,20 @@ python transcribe.py
 
 | Engine         | Runs on                                | Default model    |
 |----------------|----------------------------------------|------------------|
-| mlx-whisper    | Macs with Apple Silicon (GPU)          | `large-v3-turbo` |
+| mlx-whisper    | Macs with Apple Silicon (GPU)          | `medium`         |
 | openai-whisper | macOS, Windows, Linux (CUDA, MPS, CPU) | `medium`         |
 
 Both engines use the same Whisper models from OpenAI, so their results are comparable. When both are installed, mlx-whisper is the default. You can switch engines in the settings.
 
 ## Whisper Models
 
-| Model          | Download | Quality     |
-|----------------|----------|-------------|
-| tiny           | ~75 MB   | Fast, basic |
-| base           | ~140 MB  | Good        |
-| small          | ~460 MB  | Better      |
-| medium         | ~1.4 GB  | Very good   |
-| large-v3-turbo | ~1.6 GB  | Best        |
+| Model          | Download | Quality                      |
+|----------------|----------|------------------------------|
+| tiny           | ~75 MB   | Fast, basic                  |
+| base           | ~140 MB  | Good                         |
+| small          | ~460 MB  | Better                       |
+| medium         | ~1.5 GB  | Very good (default)          |
+| large-v3-turbo | ~1.6 GB  | Very good, newer and faster  |
 
 A model is downloaded automatically the first time you use it. openai-whisper caches its models in `~/.cache/whisper`, mlx-whisper in `~/.cache/huggingface`. The Mac app keeps its models in its own data folder.
 

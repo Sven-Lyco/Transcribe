@@ -64,7 +64,7 @@ ENGINES = {
             "medium": "mlx-community/whisper-medium-mlx",
             "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
         },
-        "default_model": "large-v3-turbo",
+        "default_model": "medium",
     },
     "openai": {
         "label": "openai-whisper",

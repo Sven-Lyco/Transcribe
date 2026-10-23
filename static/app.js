@@ -9,8 +9,8 @@ const MODEL_INFO = {
   tiny: ['tiny — schnell, ~75 MB', 'Schnellste Option — für kurze Nachrichten gut geeignet.'],
   base: ['base — gut, ~140 MB', 'Gute Balance aus Geschwindigkeit und Qualität.'],
   small: ['small — besser, ~460 MB', 'Bessere Genauigkeit, dauert etwas länger.'],
-  medium: ['medium — sehr gut, ~1,4 GB', 'Sehr hohe Genauigkeit, gut bei Dialekt/Umgangssprache.'],
-  'large-v3-turbo': ['large-v3-turbo — am besten, ~1,6 GB', 'Höchste Genauigkeit, auch bei Dialekt und Umgangssprache — empfohlen mit mlx-whisper.'],
+  medium: ['medium — sehr gut, ~1,5 GB', 'Sehr hohe Genauigkeit, gut bei Dialekt/Umgangssprache — empfohlen.'],
+  'large-v3-turbo': ['large-v3-turbo — groß, ~1,6 GB', 'Neuestes Modell, schnell; je nach Aufnahme etwas besser oder schlechter als medium.'],
 };
 const LANGUAGE_NAMES = { de: 'Deutsch', en: 'English', auto: 'Auto-detect' };
 
@@ -258,7 +258,7 @@ $('openFolderBtn').addEventListener('click', () => {
 
 $('resetBtn').addEventListener('click', async () => {
   const question = 'Alle App-Daten löschen?\n\n'
-    + 'Das löscht alle Transkripte, den Verlauf und das heruntergeladene Whisper-Modell (ca. 1,6 GB). '
+    + 'Das löscht alle Transkripte, den Verlauf und die heruntergeladenen Whisper-Modelle. '
     + 'Das lässt sich nicht rückgängig machen.';
   if (!confirm(question)) return;
   const msg = $('settingsMsg');
