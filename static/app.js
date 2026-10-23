@@ -4,16 +4,15 @@ const HISTORY_KEY = 'transcripts';
 const PENDING_KEY = 'pendingJobs';
 const SETTINGS_KEY = 'settings';
 const HISTORY_MAX = 200;
-const PENDING_MAX_AGE = 2 * 60 * 60 * 1000;  // länger hält der Server kein Ergebnis vor
+const PENDING_MAX_AGE = 2 * 60 * 60 * 1000;  // danach hat der Server das Ergebnis längst verworfen
 const MAX_RETRIES = 20;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MODEL_INFO = {
   tiny: ['tiny — schnell, ~75 MB', 'Schnellste Option — für kurze Nachrichten gut geeignet.'],
   base: ['base — gut, ~140 MB', 'Gute Balance aus Geschwindigkeit und Qualität.'],
   small: ['small — besser, ~460 MB', 'Bessere Genauigkeit, dauert etwas länger.'],
-  medium: ['medium — sehr gut, ~1,4 GB', 'Sehr hohe Genauigkeit — empfohlen für Dialekt/Umgangssprache.'],
-  'large-v3-turbo': ['large-v3-turbo — am besten, ~1,6 GB', 'Höchste Genauigkeit, auch bei Dialekt und Umgangssprache.'],
+  medium: ['medium — sehr gut, ~1,4 GB', 'Sehr hohe Genauigkeit, gut bei Dialekt/Umgangssprache.'],
+  'large-v3-turbo': ['large-v3-turbo — am besten, ~1,6 GB', 'Höchste Genauigkeit, auch bei Dialekt und Umgangssprache — empfohlen mit mlx-whisper.'],
 };
 const LANGUAGE_NAMES = { de: 'Deutsch', en: 'English', auto: 'Auto-detect' };
 
@@ -31,11 +30,12 @@ const store = {
   },
 };
 
-let config = { hosted: false, models: ['tiny', 'base', 'small', 'medium'], default_model: 'medium' };
+let config = { engines: [], default_engine: null };
+let modelChoice = {};  // gewähltes Modell je Engine
 let selectedFile = null;
 const watchers = new Map();  // job_id -> laufende Verbindung
 
-const tokenInput = $('token');
+const engineSelect = $('engine');
 const modelSelect = $('model');
 const languageSelect = $('language');
 const outputFolderInput = $('outputFolder');
@@ -47,40 +47,40 @@ const jobsEl = $('jobs');
 
 // ---------- Einstellungen ----------
 
+function option(value, label) {
+  return Object.assign(document.createElement('option'), { value, textContent: label });
+}
+
+const currentEngine = () => config.engines.find((e) => e.id === engineSelect.value) || config.engines[0];
+
 function applyConfig() {
-  modelSelect.replaceChildren(...config.models.map((name) => {
-    const option = document.createElement('option');
-    option.value = name;
-    option.textContent = (MODEL_INFO[name] || [name])[0];
-    return option;
-  }));
-  $('tokenField').hidden = !config.hosted;
-  $('outputFolderField').hidden = config.hosted;
-  $('subtitle').textContent = config.hosted
-    ? '// eigener Server · Verlauf nur in diesem Browser'
-    : '// lokal · kein API-Key · kein Internet';
-  if (config.hosted) {
-    $('emptyHint').textContent = 'Teile eine WhatsApp-Sprachnachricht über den Kurzbefehl oder wähle oben eine Audiodatei aus.';
-  }
-  // iOS graut .opus-Dateien aus, wenn accept gesetzt ist
-  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent)
-    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  if (isIOS) fileInput.removeAttribute('accept');
+  engineSelect.replaceChildren(...config.engines.map((e) => option(e.id, e.label)));
+  $('engineField').hidden = config.engines.length < 2;
+}
+
+function fillModels() {
+  const engine = currentEngine();
+  if (!engine) return;
+  modelSelect.replaceChildren(...engine.models.map((name) => option(name, (MODEL_INFO[name] || [name])[0])));
+  const preferred = modelChoice[engine.id];
+  modelSelect.value = engine.models.includes(preferred) ? preferred : engine.default_model;
 }
 
 function loadSettings() {
   const s = store.get(SETTINGS_KEY, {});
-  tokenInput.value = s.token || '';
-  modelSelect.value = config.models.includes(s.model) ? s.model : config.default_model;
+  modelChoice = s.models || {};
+  engineSelect.value = config.engines.some((e) => e.id === s.engine) ? s.engine : config.default_engine;
+  fillModels();
   languageSelect.value = LANGUAGE_NAMES[s.language] ? s.language : 'de';
   outputFolderInput.value = s.outputFolder || '';
   updateSummary();
 }
 
 function saveSettings() {
+  modelChoice[engineSelect.value] = modelSelect.value;
   store.set(SETTINGS_KEY, {
-    token: tokenInput.value.trim(),
-    model: modelSelect.value,
+    engine: engineSelect.value,
+    models: modelChoice,
     language: languageSelect.value,
     outputFolder: outputFolderInput.value.trim(),
   });
@@ -89,12 +89,12 @@ function saveSettings() {
 
 function updateSummary() {
   const hint = (MODEL_INFO[modelSelect.value] || [])[1] || '';
-  $('modelHint').textContent = config.hosted
-    ? `Läuft auf dem Server. ${hint}`
-    : `Beim ersten Mal wird das Modell heruntergeladen. ${hint}`;
+  $('modelHint').textContent = `Beim ersten Mal wird das Modell heruntergeladen. ${hint}`;
+  const engine = currentEngine();
+  const engineName = engine ? ` (${engine.label.split(' (')[0]})` : '';
   const summary = $('summary');
   summary.replaceChildren(
-    `Modell: ${modelSelect.value} · Sprache: ${LANGUAGE_NAMES[languageSelect.value]} · `,
+    `Modell: ${modelSelect.value}${engineName} · Sprache: ${LANGUAGE_NAMES[languageSelect.value]} · `,
     Object.assign(document.createElement('button'), {
       className: 'link-btn', type: 'button', textContent: 'ändern', onclick: () => toggleSettings(true),
     }),
@@ -109,8 +109,12 @@ function toggleSettings(open) {
 }
 
 $('settingsBtn').addEventListener('click', () => toggleSettings());
-[tokenInput, outputFolderInput].forEach((el) => el.addEventListener('input', saveSettings));
+outputFolderInput.addEventListener('input', saveSettings);
 [modelSelect, languageSelect].forEach((el) => el.addEventListener('change', saveSettings));
+engineSelect.addEventListener('change', () => {
+  fillModels();
+  saveSettings();
+});
 
 // ---------- Verlauf ----------
 
@@ -462,7 +466,7 @@ function selectFile(file) {
   $('fileInfo').textContent = `${file.name} (${mb} MB)`;
   startBtn.disabled = false;
   // file.path is available in some local/Electron environments
-  if (file.path && !config.hosted) {
+  if (file.path) {
     const sep = file.path.includes('/') ? '/' : '\\';
     outputFolderInput.value = file.path.substring(0, file.path.lastIndexOf(sep));
   }
@@ -470,13 +474,6 @@ function selectFile(file) {
 
 startBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
-  const token = tokenInput.value.trim();
-  if (config.hosted && !token) {
-    toggleSettings(true);
-    tokenInput.focus();
-    $('settingsMsg').textContent = 'Bitte zuerst das Token eintragen.';
-    return;
-  }
 
   const file = selectedFile;
   startBtn.disabled = true;
@@ -488,22 +485,21 @@ startBtn.addEventListener('click', async () => {
 
   const formData = new FormData();
   formData.append('file', file);
+  formData.append('engine', engineSelect.value);
   formData.append('model', modelSelect.value);
   formData.append('language', languageSelect.value);
   formData.append('speaker_name', speakerNameInput.value.trim());
-  if (!config.hosted) formData.append('output_folder', outputFolderInput.value.trim());
+  formData.append('output_folder', outputFolderInput.value.trim());
 
   try {
     const response = await fetch('/transcribe', {
       method: 'POST',
       body: formData,
-      headers: config.hosted ? { Authorization: `Bearer ${token}` } : {},
       signal: controller.signal,
     });
     const data = await response.json();
     if (data.error) {
       upload.fail('Fehler', data.error);
-      if (response.status === 401) toggleSettings(true);
       startBtn.disabled = false;
       return;
     }
@@ -533,20 +529,15 @@ async function init() {
   loadSettings();
   renderHistory();
 
-  // Vom Kurzbefehl geöffnet: /?job=<id>
-  const jobId = new URLSearchParams(location.search).get('job');
-  if (jobId && UUID_RE.test(jobId)) {
-    addPending({ id: jobId, fileName: '', startedAt: Date.now() });
-  }
-  if (location.search) history.replaceState(null, '', location.pathname);
   resumePending();
 
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
-  }
+  // Eine frühere Version hat einen Service Worker registriert, der nicht mehr gebraucht wird
+  navigator.serviceWorker?.getRegistrations()
+    .then((regs) => regs.forEach((reg) => reg.unregister()))
+    .catch(() => {});
 }
 
-// Safari pausiert Hintergrund-Tabs; beim Zurückkehren offene Jobs wieder aufnehmen
+// Browser pausieren Hintergrund-Tabs; beim Zurückkehren offene Jobs wieder aufnehmen
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     renderHistory();

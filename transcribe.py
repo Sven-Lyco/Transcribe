@@ -1,28 +1,22 @@
 """
-Whisper Transkriptions-Tool
-===========================
-Lokal (Standard):
+Lokales Whisper Transkriptions-Tool
+====================================
+Einmalige Installation (einmal ausführen):
     pip install openai-whisper
+    pip install mlx-whisper     # zusätzlich auf Macs mit Apple Silicon, deutlich schneller
+
+Danach einfach starten:
     python transcribe.py
 
-    Öffnet dann automatisch http://127.0.0.1:8765 im Browser.
+Öffnet dann automatisch http://127.0.0.1:8765 im Browser.
 
-    Anderer Port:
-        python transcribe.py --port 9000
-
-Gehostet (z.B. Docker/Coolify, siehe Dockerfile):
-    pip install faster-whisper
-    TRANSCRIBE_HOSTED=1 TRANSCRIBE_TOKEN=<geheim> python transcribe.py
-
-    Lauscht auf allen Interfaces, verlangt das Token beim Upload und
-    speichert keine Transkripte auf dem Server.
+Anderer Port:
+    python transcribe.py --port 9000
 """
 
 import argparse
 import errno
-import hmac
 import http.server
-import io
 import socketserver
 import json
 import os
@@ -40,11 +34,7 @@ import glob
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-HOSTED = os.environ.get("TRANSCRIBE_HOSTED") == "1"
-TOKEN = os.environ.get("TRANSCRIBE_TOKEN", "").strip()
-MIN_TOKEN_LENGTH = 32
-
-HOST = "0.0.0.0" if HOSTED else "127.0.0.1"
+HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PORT_SUGGESTIONS = 3  # Anzahl freier Ports, die bei belegtem Port angeboten werden
 # Ports, die Browser nicht öffnen (ERR_UNSAFE_PORT)
@@ -55,41 +45,48 @@ BROWSER_BLOCKED_PORTS = frozenset({
     587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060,
     5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
 })
-# Gehostet läuft faster-whisper auf der CPU; tiny/base lohnen sich dort nicht.
-MODELS = ("small", "medium", "large-v3-turbo") if HOSTED else ("tiny", "base", "small", "medium")
-DEFAULT_MODEL = os.environ.get("TRANSCRIBE_MODEL", "large-v3-turbo" if HOSTED else "medium")
+# Whisper-Engines in der Reihenfolge, in der sie als Standard bevorzugt werden.
+# mlx-whisper rechnet auf der GPU von Apple Silicon, openai-whisper läuft überall (CUDA, MPS, CPU).
+# Beide nutzen dieselben Modelle von OpenAI; "models" bildet den Namen in der Oberfläche
+# auf den Namen der jeweiligen Engine ab.
+ENGINES = {
+    "mlx": {
+        "label": "mlx-whisper (Apple Silicon)",
+        "module": "mlx_whisper",
+        "models": {
+            "tiny": "mlx-community/whisper-tiny-mlx",
+            "base": "mlx-community/whisper-base-mlx",
+            "small": "mlx-community/whisper-small-mlx",
+            "medium": "mlx-community/whisper-medium-mlx",
+            "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+        },
+        "default_model": "large-v3-turbo",
+    },
+    "openai": {
+        "label": "openai-whisper",
+        "module": "whisper",
+        "models": {name: name for name in ("tiny", "base", "small", "medium", "large-v3-turbo")},
+        "default_model": "medium",
+    },
+}
 LANGUAGES = ("de", "en", "auto")
 
 JOB_TTL = 15 * 60  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Speicher bleibt
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # nur gehostet
-MAX_ACTIVE_JOBS = 5  # gehostet: wartende + laufende Transkriptionen
-MAX_CONNECTIONS = 64  # gleichzeitige Verbindungen, darüber wird sofort geschlossen
 SOCKET_TIMEOUT = 60  # Sekunden ohne Datenfluss, bevor eine Verbindung aufgegeben wird
 MAX_FILE_NAME = 200
 
 STATIC_DIR = Path(__file__).parent / "static"
-# Ausgelieferte Dateien: Pfad -> (Datei, Content-Type, Cache-Control)
+# Ausgelieferte Dateien: Pfad -> (Datei, Content-Type)
 STATIC_FILES = {
-    "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8", "no-cache"),
-    "/app.css": ("app.css", "text/css; charset=utf-8", "no-cache"),
-    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json", "no-cache"),
-    "/sw.js": ("sw.js", "text/javascript; charset=utf-8", "no-cache"),
-    "/icon.svg": ("icon.svg", "image/svg+xml", "max-age=86400"),
-    "/icon-192.png": ("icon-192.png", "image/png", "max-age=86400"),
-    "/icon-512.png": ("icon-512.png", "image/png", "max-age=86400"),
-    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png", "max-age=86400"),
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
 }
 # Die Seite lädt nichts von fremden Servern und führt keine eingebetteten Scripts aus
 CSP = (
     "default-src 'self'; img-src 'self' data:; object-src 'none'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
-PERMISSIONS_POLICY = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
-
-
-class TranscriptionError(Exception):
-    """Fehler, dessen Meldung der Nutzer sehen darf."""
 
 # ffmpeg automatisch finden (PATH, Windows WinGet + macOS Homebrew)
 def find_and_add_ffmpeg():
@@ -128,15 +125,15 @@ def find_and_add_ffmpeg():
     return False
 
 
-# werden erst in load_whisper() importiert, damit --help nicht auf den Import wartet
-whisper = None
-WhisperModel = None
+# Installierte Engines (Name -> Modul), erst in load_engines() importiert,
+# damit --help nicht auf den Import wartet
+_engines: dict = {}
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 _tqdm_local = threading.local()
 
-_models: dict = {}  # zuletzt benutztes Modell, bleibt zwischen den Jobs geladen
+_models: dict = {}  # zuletzt benutztes openai-whisper-Modell; mlx-whisper hält seins selbst
 _transcribe_lock = threading.Lock()  # immer nur eine Transkription, sonst bremsen sich die Jobs aus
 
 
@@ -161,33 +158,30 @@ def _set_progress(job_id, pct):
         _jobs[job_id]["progress"] = max(0, min(99, int(pct)))
 
 
-def load_whisper():
-    """Importiert die Whisper-Engine des aktuellen Modus."""
-    global whisper, WhisperModel
-    if HOSTED:
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            print("=" * 50)
-            print("faster-whisper ist nicht installiert.")
-            print("Bitte einmalig ausführen:")
-            print("    pip install faster-whisper")
-            print("=" * 50)
-            sys.exit(1)
-        return
+def load_engines():
+    """Importiert die installierten Engines und leitet ihre Fortschrittsbalken an den laufenden Job weiter."""
+    import importlib
+    import tqdm as _tqdm_module
 
-    try:
-        import whisper
-        import tqdm as _tqdm_module
-    except ImportError:
+    for name, engine in ENGINES.items():
+        try:
+            _engines[name] = importlib.import_module(engine["module"])
+        except ImportError:
+            pass  # nicht installiert
+        except Exception as e:
+            print(f"  {engine['label']} ist installiert, lässt sich aber nicht laden: {e}")
+
+    if not _engines:
         print("=" * 50)
         print("Whisper ist nicht installiert.")
         print("Bitte einmalig ausführen:")
         print("    pip install openai-whisper")
+        if sys.platform == "darwin" and os.uname().machine == "arm64":
+            print("    pip install mlx-whisper   (Apple Silicon, deutlich schneller)")
         print("=" * 50)
         sys.exit(1)
 
-    # Fortschrittsbalken von openai-whisper an den laufenden Job weiterleiten
+    # Beide Engines zeigen ihren Fortschritt über tqdm.tqdm an
     _orig_tqdm = _tqdm_module.tqdm
 
     class _ProgressTqdm(_orig_tqdm):
@@ -201,118 +195,75 @@ def load_whisper():
     _tqdm_module.tqdm = _ProgressTqdm
 
 
-def _get_model(model_name):
+def _load_openai_model(model_name):
     """Lädt das Modell beim ersten Gebrauch und hält es danach im Speicher. Nur mit _transcribe_lock aufrufen."""
     if model_name in _models:
         return _models[model_name]
     _models.clear()  # nur ein Modell im Speicher halten
 
-    print(f"  → Lade Modell '{model_name}'...")
-    if HOSTED:
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    import torch
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
     else:
-        import torch
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        device = "cpu"
 
-        # Auf CPU laden und alignment_heads (sparse Tensor) in dense umwandeln,
-        # da MPS keine sparse Tensoren unterstützt (siehe pytorch/pytorch#78168).
-        model = whisper.load_model(model_name, device="cpu")
-        if device != "cpu":
-            model.alignment_heads = model.alignment_heads.to_dense()
-            model = model.to(device)
+    print(f"  → Lade Modell '{model_name}'...")
+    # Auf CPU laden und alignment_heads (sparse Tensor) in dense umwandeln,
+    # da MPS keine sparse Tensoren unterstützt (siehe pytorch/pytorch#78168).
+    model = _engines["openai"].load_model(model_name, device="cpu")
+    if device != "cpu":
+        model.alignment_heads = model.alignment_heads.to_dense()
+        model = model.to(device)
 
     _models[model_name] = model
     return model
 
 
-def _preload_model(model_name):
-    """Lädt das Standardmodell vorab, damit der erste Upload nicht auf den Download wartet."""
-    try:
-        with _transcribe_lock:
-            _get_model(model_name)
-        print(f"  ✓ Modell '{model_name}' bereit")
-    except Exception as e:
-        print(f"  Modell '{model_name}' konnte nicht vorab geladen werden: {e}")
-
-
-def _transcribe_openai(job_id, model, path, language):
-    _tqdm_local.job_id = job_id
-    kwargs = {"verbose": False}
-    if language != "auto":
-        kwargs["language"] = language
-
+def _transcribe_openai(model_name, path, kwargs):
+    model = _load_openai_model(model_name)
     # fp16 nur auf CUDA aktivieren: Apples MPS-Backend liefert bei manchen
     # Whisper-Modellen in fp16 NaN-Logits, daher dort auf fp32 bleiben.
-    result = model.transcribe(path, fp16=(model.device.type == "cuda"), **kwargs)
+    return model.transcribe(path, fp16=(model.device.type == "cuda"), **kwargs)
 
+
+def _transcribe_mlx(model_name, path, kwargs):
+    # Lädt das Modell beim ersten Gebrauch (Download über Hugging Face) und hält es danach selbst im Speicher
+    repo = ENGINES["mlx"]["models"][model_name]
+    return _engines["mlx"].transcribe(path, path_or_hf_repo=repo, **kwargs)
+
+
+def _audio_duration(path):
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True
         )
-        duration = round(float(r.stdout.strip()))
+        return round(float(r.stdout.strip()))
     except Exception:
-        duration = "?"
-
-    return result["text"].strip(), result.get("language", "?"), duration
+        return "?"
 
 
-def _decode_audio(data, sampling_rate=16000):
-    """Dekodiert die Audiodaten im Speicher per PyAV zu 16-kHz-Mono, wie es Whisper erwartet.
-
-    Ersetzt faster_whisper.decode_audio: Das übergibt in 1.2.1 `metadata_errors`,
-    das PyAV ab Version 15 nicht mehr kennt.
-    """
-    import av
-    import numpy as np
-    no_audio = "Die Datei enthält keine Tonspur."
-    resampler = av.AudioResampler(format="s16", layout="mono", rate=sampling_rate)
-    chunks = []
-    try:
-        with av.open(io.BytesIO(data)) as container:
-            if not container.streams.audio:
-                raise TranscriptionError(no_audio)
-            for frame in container.decode(audio=0):
-                chunks.extend(f.to_ndarray().reshape(-1) for f in resampler.resample(frame))
-        chunks.extend(f.to_ndarray().reshape(-1) for f in resampler.resample(None))  # Rest leeren
-    except (av.FFmpegError, ValueError) as e:
-        raise TranscriptionError("Audio konnte nicht gelesen werden (beschädigt oder unbekanntes Format).") from e
-    if not chunks:
-        raise TranscriptionError(no_audio)
-    return np.concatenate(chunks).astype(np.float32) / 32768.0
-
-
-def _transcribe_faster(job_id, model, data, language):
-    # vad_filter überspringt Stille, in der Whisper sonst gern Text erfindet
-    segments, info = model.transcribe(
-        _decode_audio(data), language=None if language == "auto" else language, vad_filter=True,
-    )
-    parts = []
-    for segment in segments:  # Generator: transkribiert wird erst beim Durchlaufen
-        parts.append(segment.text)
-        if info.duration:
-            _set_progress(job_id, segment.end / info.duration * 100)
-    return "".join(parts).strip(), info.language, round(info.duration)
-
-
-def _run_transcription(job_id, model_name, audio, language, speaker_name, output_folder, file_name):
-    """`audio` ist gehostet der Dateiinhalt (bleibt im Speicher), lokal der Pfad einer Temp-Datei."""
-    label = f"Job {job_id[:8]}" if HOSTED else repr(file_name)  # gehostet keine Dateinamen ins Log
+def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_name, output_folder, file_name):
+    _tqdm_local.job_id = job_id
     try:
         with _transcribe_lock:
             with _jobs_lock:
                 _raise_if_cancelled(job_id)  # schon abgebrochen, während der Job wartete
                 _jobs[job_id]["state"] = "running"
-            model = _get_model(model_name)
-            print(f"  → Transkribiere {label}...")
-            transcribe = _transcribe_faster if HOSTED else _transcribe_openai
-            text, lang, duration = transcribe(job_id, model, audio, language)
+            print(f"  → Transkribiere '{file_name}' mit {engine}/{model_name}...")
+            # verbose=False zeigt den tqdm-Fortschritt, über den Fortschritt und Abbruch laufen
+            kwargs = {"verbose": False}
+            if language != "auto":
+                kwargs["language"] = language
+            transcribe = _transcribe_mlx if engine == "mlx" else _transcribe_openai
+            result = transcribe(model_name, tmp_path, kwargs)
+
+        text = result["text"].strip()
+        lang = result.get("language", "?")
+        duration = _audio_duration(tmp_path)
 
         ts_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+at\s+(\d{2}\.\d{2}\.\d{2})', file_name)
         timestamp = f"{ts_match.group(1)} - {ts_match.group(2)}" if ts_match else None
@@ -331,19 +282,14 @@ def _run_transcription(job_id, model_name, audio, language, speaker_name, output
         with _jobs_lock:
             _raise_if_cancelled(job_id)  # kurz vor Schluss abgebrochen: nichts mehr speichern
 
-        saved_as = None
-        if not HOSTED:
-            if output_folder and Path(output_folder).is_dir():
-                save_dir = Path(output_folder)
-            else:
-                save_dir = Path(__file__).parent / "transcriptions"
-                save_dir.mkdir(exist_ok=True)
-            txt_path = save_dir / (Path(file_name).stem + ".txt")
-            txt_path.write_text(formatted_text, encoding="utf-8")
-            saved_as = str(txt_path)
-            print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
+        if output_folder and Path(output_folder).is_dir():
+            save_dir = Path(output_folder)
         else:
-            print(f"  ✓ Job {job_id[:8]} fertig")
+            save_dir = Path(__file__).parent / "transcriptions"
+            save_dir.mkdir(exist_ok=True)
+        txt_path = save_dir / (Path(file_name).stem + ".txt")
+        txt_path.write_text(formatted_text, encoding="utf-8")
+        print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
 
         with _jobs_lock:
             if job_id in _jobs:
@@ -355,24 +301,17 @@ def _run_transcription(job_id, model_name, audio, language, speaker_name, output
                         "text": formatted_text,
                         "language": lang,
                         "duration": duration,
-                        "saved_as": saved_as,
+                        "saved_as": str(txt_path),
                     },
                 })
     except JobCancelled:
-        print(f"  ⏹ {label} abgebrochen")
+        print(f"  ⏹ '{file_name}' abgebrochen")
     except Exception as e:
-        if isinstance(e, TranscriptionError) or not HOSTED:
-            message = str(e)
-        else:
-            # Interne Details (Pfade, Bibliotheksfehler) nur ins Server-Log
-            print(f"  ✗ {label} fehlgeschlagen: {e!r}")
-            message = "Transkription fehlgeschlagen. Details stehen im Server-Log."
         with _jobs_lock:
             if job_id in _jobs:
-                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
+                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": str(e)})
     finally:
-        if not HOSTED:
-            os.unlink(audio)
+        os.unlink(tmp_path)
 
 
 def _prune_jobs():
@@ -390,7 +329,7 @@ def _prune_jobs_forever():
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    timeout = SOCKET_TIMEOUT  # hängende oder absichtlich langsame Verbindungen nicht ewig offen halten
+    timeout = SOCKET_TIMEOUT  # hängende Verbindungen nicht ewig offen halten
 
     def log_message(self, format, *args):
         pass  # Stille Logs
@@ -402,14 +341,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Gilt für alle Antworten, auch für Fehlerseiten von send_error
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        if HOSTED:
-            self.send_header("Strict-Transport-Security", "max-age=31536000")
         super().end_headers()
 
     def _is_local_request(self):
         """Lässt nur Anfragen der eigenen Seite zu, nicht die fremder Webseiten im selben Browser."""
-        if HOSTED:
-            return True  # gehostet schützt das Token den Upload
         port = self.server.server_address[1]
         names = ("127.0.0.1", "localhost")
         hosts = {f"{name}:{port}" for name in names}
@@ -419,12 +354,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         origin = self.headers.get("Origin")
         return origin is None or origin in {f"http://{host}" for host in hosts}
-
-    def _is_authorized(self):
-        if not HOSTED:
-            return True
-        auth = self.headers.get("Authorization", "")
-        return hmac.compare_digest(auth.encode(), f"Bearer {TOKEN}".encode())
 
     def do_GET(self):
         if not self._is_local_request():
@@ -438,15 +367,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/config":
             self._json_response({
-                "hosted": HOSTED,
-                "models": MODELS,
-                "default_model": DEFAULT_MODEL,
+                "engines": [
+                    {
+                        "id": name,
+                        "label": ENGINES[name]["label"],
+                        "models": list(ENGINES[name]["models"]),
+                        "default_model": ENGINES[name]["default_model"],
+                    }
+                    for name in _engines
+                ],
+                "default_engine": next(iter(_engines)),
                 "languages": LANGUAGES,
             })
             return
 
         if parsed.path in STATIC_FILES:
-            name, content_type, cache = STATIC_FILES[parsed.path]
+            name, content_type = STATIC_FILES[parsed.path]
             try:
                 body = (STATIC_DIR / name).read_bytes()
             except FileNotFoundError:
@@ -455,10 +391,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", len(body))
-            self.send_header("Cache-Control", cache)
+            self.send_header("Cache-Control", "no-cache")
             if name == "index.html":
                 self.send_header("Content-Security-Policy", CSP)
-                self.send_header("Permissions-Policy", PERMISSIONS_POLICY)
             self.end_headers()
             self.wfile.write(body)
             return
@@ -473,9 +408,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")  # Transkripte nirgends zwischenspeichern
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")  # Reverse-Proxys sollen den Stream nicht puffern
         self.end_headers()
         try:
             while True:
@@ -538,10 +472,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if not self._is_authorized():
-            self._json_response({"error": "Ungültiges oder fehlendes Token."}, status=401)
-            return
-
         content_type = self.headers.get("Content-Type", "")
         if "boundary=" not in content_type:
             self._json_response({"error": "Erwartet multipart/form-data."}, status=400)
@@ -553,22 +483,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if length < 0:
             self._json_response({"error": "Content-Length fehlt."}, status=411)
             return
-        if HOSTED and length > MAX_UPLOAD_BYTES:
-            self._json_response(
-                {"error": f"Datei zu groß (max. {MAX_UPLOAD_BYTES // 1024 // 1024} MB)."}, status=413,
-            )
-            return
-
-        if HOSTED:
-            with _jobs_lock:
-                active = sum(1 for j in _jobs.values() if not j["done"])
-            if active >= MAX_ACTIVE_JOBS:
-                self._json_response(
-                    {"error": "Server ausgelastet. Bitte in ein paar Minuten noch einmal versuchen."},
-                    status=503,
-                )
-                return
-
         body = self.rfile.read(length)
 
         # Parse multipart
@@ -577,7 +491,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         file_data = None
         file_name = "audio.ogg"
-        model_name = DEFAULT_MODEL
+        engine = next(iter(_engines))
+        model_name = ""
         language = "de"
         speaker_name = ""
         output_folder = ""
@@ -595,6 +510,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if 'filename="' in header_str:
                     name = header_str.split('filename="')[1].split('"')[0]
                     file_name = Path(name).name[:MAX_FILE_NAME] or file_name
+            elif 'name="engine"' in header_str:
+                engine = content.decode(errors="replace").strip()
             elif 'name="model"' in header_str:
                 model_name = content.decode(errors="replace").strip()
             elif 'name="language"' in header_str:
@@ -608,31 +525,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_response({"error": "Keine Datei empfangen."}, status=400)
             return
 
-        if model_name not in MODELS:
-            self._json_response({"error": f"Unbekanntes Modell. Erlaubt: {', '.join(MODELS)}"}, status=400)
+        if engine not in _engines:
+            self._json_response({"error": f"Engine nicht installiert. Verfügbar: {', '.join(_engines)}"}, status=400)
+            return
+
+        models = ENGINES[engine]["models"]
+        model_name = model_name or ENGINES[engine]["default_model"]
+        if model_name not in models:
+            self._json_response({"error": f"Unbekanntes Modell. Erlaubt: {', '.join(models)}"}, status=400)
             return
 
         if language not in LANGUAGES:
             self._json_response({"error": f"Unbekannte Sprache. Erlaubt: {', '.join(LANGUAGES)}"}, status=400)
             return
 
-        if HOSTED:
-            output_folder = ""  # gehostet wird nichts gespeichert
-        elif output_folder:
+        if output_folder:
             output_dir = Path(output_folder).expanduser()
             if not output_dir.is_dir():
                 self._json_response({"error": f"Ausgabeordner nicht gefunden: {output_folder}"})
                 return
             output_folder = str(output_dir)
 
-        if HOSTED:
-            audio = file_data  # bleibt im Speicher, landet nie auf der Platte
-        else:
-            # openai-whisper braucht einen Dateipfad für ffmpeg
-            suffix = Path(file_name).suffix or ".ogg"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(file_data)
-                audio = tmp.name
+        suffix = Path(file_name).suffix or ".ogg"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
 
         _prune_jobs()
         job_id = str(uuid.uuid4())
@@ -649,7 +566,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         threading.Thread(
             target=_run_transcription,
-            args=(job_id, model_name, audio, language, speaker_name, output_folder, file_name),
+            args=(job_id, engine, model_name, tmp_path, language, speaker_name, output_folder, file_name),
             daemon=True,
         ).start()
 
@@ -667,23 +584,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True  # Ctrl+C soll nicht auf offene Fortschritts-Streams warten
-
-    def __init__(self, *args, **kwargs):
-        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
-        super().__init__(*args, **kwargs)
-
-    def process_request(self, request, client_address):
-        # Bei zu vielen gleichzeitigen Verbindungen sofort schließen statt unbegrenzt Threads zu starten
-        if not self._slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
-        super().process_request(request, client_address)
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._slots.release()
 
 
 def parse_port(value):
@@ -795,7 +695,7 @@ def create_server(port):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Whisper Transkriptions-Tool")
+    parser = argparse.ArgumentParser(description="Lokales Whisper Transkriptions-Tool")
     parser.add_argument(
         "-p", "--port", type=parse_port, default=DEFAULT_PORT,
         help=f"Port für die Weboberfläche (Standard: {DEFAULT_PORT})",
@@ -806,40 +706,29 @@ def main():
     )
     args = parser.parse_args()
 
-    if DEFAULT_MODEL not in MODELS:
-        print(f"  Unbekanntes Standardmodell '{DEFAULT_MODEL}'. Erlaubt: {', '.join(MODELS)}")
-        sys.exit(1)
-
-    if HOSTED:
-        if len(TOKEN) < MIN_TOKEN_LENGTH:
-            print(f"  TRANSCRIBE_TOKEN fehlt oder ist kürzer als {MIN_TOKEN_LENGTH} Zeichen.")
-            print("  Ein sicheres Token erzeugen mit: openssl rand -hex 32")
-            sys.exit(1)
-    elif not find_and_add_ffmpeg():
+    if not find_and_add_ffmpeg():
         print("  Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.")
         print("  Installation: brew install ffmpeg (macOS), winget install Gyan.FFmpeg (Windows),")
         print("                sudo apt install ffmpeg (Linux)")
 
-    load_whisper()
+    load_engines()
 
     httpd = create_server(args.port)
     url = f"http://{HOST}:{httpd.server_address[1]}"
-    open_browser = not (HOSTED or args.no_browser)
 
     print("=" * 50)
-    print("  Whisper Transkriptions-Tool" + (" (gehostet)" if HOSTED else ""))
+    print("  Whisper Transkriptions-Tool")
     print("=" * 50)
     print(f"  Server läuft auf {url}")
-    if open_browser:
+    print(f"  Engines: {', '.join(ENGINES[name]['label'] for name in _engines)}")
+    if not args.no_browser:
         print("  Browser öffnet sich automatisch...")
     stop_key = "Strg+C" if sys.platform == "win32" else "Ctrl+C"
     print(f"  Zum Beenden: {stop_key}")
     print("=" * 50)
 
     threading.Thread(target=_prune_jobs_forever, daemon=True).start()
-    if HOSTED:
-        threading.Thread(target=_preload_model, args=(DEFAULT_MODEL,), daemon=True).start()
-    if open_browser:
+    if not args.no_browser:
         threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
     with httpd:

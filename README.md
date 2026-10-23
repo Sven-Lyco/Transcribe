@@ -2,39 +2,29 @@
 
 A local audio transcription tool with a small web UI, powered by [OpenAI Whisper](https://github.com/openai/whisper). Audio is transcribed on your own machine: no API key, no account, no upload.
 
-It can also run on your own server (for example with [Coolify](https://coolify.io)) as a web app for your phone. Together with an iOS Shortcut you can transcribe WhatsApp voice messages straight from the share sheet. See [Hosting on your own server](#hosting-on-your-own-server).
+On Macs with Apple Silicon it uses [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), which runs Whisper on the GPU and is much faster. Everywhere else it uses [openai-whisper](https://github.com/openai/whisper).
 
 > **Note:** The web UI and the console messages are in German. The steps below name the German labels you will see.
 
 ## Features
 
 - Drag & drop audio files (OGG, MP3, WAV, M4A, OPUS, WebM)
-- Real-time progress bar during transcription
+- Two Whisper engines: mlx-whisper (Apple Silicon, default there) and openai-whisper
+- Real-time progress bar during transcription, with a button to cancel
 - Language selection (German, English, auto-detect)
 - Optional speaker name prefix in output
 - Timestamp extracted automatically from filename (WhatsApp format supported)
 - History of past transcriptions in the browser, with copy, delete, export, and import
 - Saves each transcription as a `.txt` file in `transcriptions/` or in a folder of your choice
 - Works on macOS, Windows, and Linux
-- GPU acceleration when available (CUDA / Apple Silicon MPS), CPU fallback otherwise
-- Optional hosted mode with token protection and an iOS Shortcut for WhatsApp voice messages
+- GPU acceleration when available (Apple Silicon via MLX or MPS, CUDA), CPU fallback otherwise
 
 ## Privacy
-
-Local mode:
 
 - Audio files and transcriptions never leave your machine.
 - The web UI is served on `127.0.0.1` only, so other devices on your network cannot reach it. Requests coming from other websites are rejected.
 - The page loads no external resources: no fonts, scripts, or analytics.
 - An internet connection is needed only to install the dependencies on the first run and to download each Whisper model the first time you select it.
-
-Hosted mode:
-
-- Audio is uploaded to your own server and transcribed there. It is kept in memory only and never written to disk.
-- The server never writes transcriptions to disk. A result stays in memory only until the web app has fetched it, and for at most 15 minutes if it is never fetched.
-- Transcriptions are stored only in the `localStorage` of the browser that fetched them.
-- Uploads require a secret token of at least 32 characters.
-- The server logs neither file names nor content.
 
 ## Requirements
 
@@ -70,14 +60,14 @@ Double-click `transcribe.bat` or run:
 transcribe.bat
 ```
 
-On the first run the script creates a virtual environment in `.venv` and installs Whisper together with PyTorch. This is a large download and can take several minutes.
+On the first run the script creates a virtual environment in `.venv` and installs Whisper together with PyTorch, plus mlx-whisper on Apple Silicon. This is a large download and can take several minutes. An existing `.venv` that was created with Python older than 3.10 is replaced automatically.
 
 The script then starts a local server and opens the web UI at `http://127.0.0.1:8765`. Press `Ctrl+C` in the terminal to stop it.
 
 ### Transcribing a file
 
 1. Drop an audio file onto the page, or click the drop area to choose one.
-2. Optional: open the settings (⚙︎ or `ändern`) to pick a model (`Modell`), the spoken language (`Sprache`), and an output folder (`Ausgabeordner`). The page remembers these settings.
+2. Optional: open the settings (⚙︎ or `ändern`) to pick the engine (`Engine`), the model (`Modell`), the spoken language (`Sprache`), and an output folder (`Ausgabeordner`). The page remembers these settings, including the chosen model for each engine.
 3. Optional: enter a speaker name (`Name`).
 4. Click `Starten`.
 
@@ -96,25 +86,38 @@ transcribe.bat --port 9000       # Windows
 
 If the port is already in use, the tool lists the next free ports at startup. Pick one by its number, type a port of your own, or press Enter to take the first suggestion.
 
+Pass `--no-browser` to start the server without opening the browser.
+
 ### Manual
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install openai-whisper
+pip install mlx-whisper    # only on Apple Silicon
 python transcribe.py
 ```
 
+## Engines
+
+| Engine         | Runs on                                | Default model    |
+|----------------|----------------------------------------|------------------|
+| mlx-whisper    | Macs with Apple Silicon (GPU)          | `large-v3-turbo` |
+| openai-whisper | macOS, Windows, Linux (CUDA, MPS, CPU) | `medium`         |
+
+Both engines use the same Whisper models from OpenAI, so their results are comparable. When both are installed, mlx-whisper is the default. You can switch engines in the settings.
+
 ## Whisper Models
 
-| Model  | Download | Quality        |
-|--------|----------|----------------|
-| tiny   | ~75 MB   | Fast, basic    |
-| base   | ~140 MB  | Good           |
-| small  | ~460 MB  | Better         |
-| medium | ~1.4 GB  | Best (default) |
+| Model          | Download | Quality     |
+|----------------|----------|-------------|
+| tiny           | ~75 MB   | Fast, basic |
+| base           | ~140 MB  | Good        |
+| small          | ~460 MB  | Better      |
+| medium         | ~1.4 GB  | Very good   |
+| large-v3-turbo | ~1.6 GB  | Best        |
 
-A model is downloaded automatically the first time you use it and cached in `~/.cache/whisper`.
+A model is downloaded automatically the first time you use it. openai-whisper caches its models in `~/.cache/whisper`, mlx-whisper in `~/.cache/huggingface`.
 
 ## Output Format
 
@@ -139,89 +142,6 @@ WhatsApp Audio 2026-08-12 at 09.49.50.ogg
 2026-08-12 - 09.49.50 - Speaker Name: Transcribed text appears here.
 ```
 
-## Hosting on your own server
-
-The same app can run on a server as a web app for your phone. In hosted mode it uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on the CPU, protects uploads with a token, and stores nothing on the server. Transcriptions are kept in the browser only.
-
-### Deploying with Coolify
-
-1. Create a new resource from this Git repository and choose the **Dockerfile** build pack.
-2. Set the port to `8765` and assign a domain with HTTPS. The web app needs HTTPS.
-3. Add the environment variable `TRANSCRIBE_TOKEN` with a random value of at least 32 characters, for example from `openssl rand -hex 32`. Do not mark it as a build variable.
-4. Add a persistent volume mounted at `/models`. Otherwise every deployment downloads the model again.
-5. Deploy. On first start the server downloads the default model (about 1.6 GB) and logs `Modell 'large-v3-turbo' bereit`.
-
-Optional environment variables:
-
-| Variable           | Default          | Meaning                                                       |
-|--------------------|------------------|---------------------------------------------------------------|
-| `TRANSCRIBE_TOKEN` | –                | Required. Secret for uploads, at least 32 characters.         |
-| `TRANSCRIBE_MODEL` | `large-v3-turbo` | Default model: `small`, `medium`, or `large-v3-turbo`.        |
-
-The server needs at least 4 GB of RAM for `large-v3-turbo`. On a CPU with 4 cores, a voice message takes roughly as long to transcribe as it is to listen to. If that is too slow, set `TRANSCRIBE_MODEL=medium` or `small`.
-
-Without Coolify:
-
-```bash
-docker build -t transcribe .
-docker run -d -p 127.0.0.1:8765:8765 -e TRANSCRIBE_TOKEN=<secret> -v transcribe-models:/models transcribe
-```
-
-Put a reverse proxy with HTTPS in front of it. Binding to `127.0.0.1` keeps the plain HTTP port off the internet.
-
-### Security checklist
-
-- **Expose the app only through the HTTPS proxy.** In Coolify set only *Ports Exposes* to `8765` and leave *Ports Mappings* empty. A mapping such as `8765:8765` makes the server reachable over plain HTTP from the internet, token included, and Docker bypasses host firewalls such as UFW.
-- **Keep the token secret.** Do not share the Shortcut, since the token is part of it. If the token leaks, set a new `TRANSCRIBE_TOKEN`, redeploy, and update the web app settings and the Shortcut.
-- **Restrict the container** (optional). The app runs as a non-root user and also works with a read-only file system and without Linux capabilities. In Coolify, add these under *Custom Docker Options* if your version supports them:
-
-  ```text
-  --read-only --tmpfs /tmp --cap-drop=ALL --security-opt=no-new-privileges
-  ```
-
-- **Keep dependencies current.** All versions in `Dockerfile` and `requirements-server.txt` are pinned. Dependabot opens a pull request each week when updates are available; merging it triggers a new deployment.
-- **Exported history files** contain all transcriptions in plain text. Store them accordingly.
-
-Built-in protections: constant-time token check, upload limit of 100 MB, at most 5 queued transcriptions, at most 64 simultaneous connections with a 60-second idle timeout, strict Content Security Policy without inline scripts, HSTS, and `Cache-Control: no-store` on all responses that contain transcriptions.
-
-### Using the web app on iPhone
-
-1. Open your domain in **Safari**.
-2. Tap ⚙︎, enter the token, and pick the model.
-3. Add the page as a Safari bookmark or to your favorites.
-
-Use the page in Safari rather than adding it to the Home Screen. The Shortcut below always opens Safari, and a Home Screen web app keeps its own separate history. iOS does not let websites appear in the share sheet, so the Shortcut is what brings WhatsApp voice messages into the web app.
-
-### iOS Shortcut for WhatsApp voice messages
-
-The Shortcut uploads the voice message and opens the web app, which shows the progress and then the text.
-
-Create a new shortcut in the Shortcuts app (German labels in parentheses):
-
-1. Open the shortcut details (ⓘ) and turn on **Show in Share Sheet** (*Im Share-Sheet anzeigen*). Set the accepted input to **Files** (*Dateien*) and **Media** (*Medien*).
-2. Add **Get Contents of URL** (*Inhalte von URL abrufen*):
-   - URL: `https://<your-domain>/transcribe`
-   - Method: `POST`
-   - Headers: `Authorization` = `Bearer <your-token>`
-   - Request Body: **Form** (*Formular*) with these fields:
-     - `file` (type **File**) = **Shortcut Input** (*Kurzbefehleingabe*)
-     - `language` (type **Text**) = `de`
-     - `model` (type **Text**) = `large-v3-turbo` (optional; without it the server default is used)
-3. Add **Get Dictionary Value** (*Wörterbuchwert abrufen*): key `job_id` from **Contents of URL**.
-4. Add **URL**: `https://<your-domain>/?job=` followed by the **Dictionary Value** variable.
-5. Add **Open URLs** (*URLs öffnen*).
-
-To transcribe a voice message, long-press it in WhatsApp, tap **Forward** (*Weiterleiten*), then the share button, and pick the shortcut. Safari opens the web app and the text appears in the history. You can leave Safari in the meantime; the web app picks the job up again when you come back.
-
-### Running hosted mode without Docker
-
-```bash
-pip install -r requirements-server.txt
-TRANSCRIBE_HOSTED=1 TRANSCRIBE_TOKEN=<secret> python transcribe.py
-```
-
-The server listens on all interfaces. ffmpeg is not needed in hosted mode; audio is decoded with PyAV.
-
 ## Troubleshooting
 
 **`Warnung: ffmpeg wurde nicht gefunden` at startup**
@@ -233,20 +153,8 @@ Another program is using the port. Choose one of the suggested ports, or start w
 **The first transcription with a model takes much longer**
 The model is being downloaded. Later runs use the cached copy.
 
-**`Ungültiges oder fehlendes Token` (hosted mode)**
-The token in the web app settings or in the Shortcut does not match `TRANSCRIBE_TOKEN` on the server.
-
-**`Job nicht gefunden` (hosted mode)**
-The transcription was cancelled, the result was not fetched within 15 minutes, or the server was restarted in the meantime. Share the voice message again.
-
-**`Server ausgelastet` (hosted mode)**
-Five transcriptions are already queued or running. Wait a few minutes and try again.
-
-**`TRANSCRIBE_TOKEN fehlt oder ist kürzer als 32 Zeichen` at startup (hosted mode)**
-Generate a longer token, for example with `openssl rand -hex 32`, and set it as `TRANSCRIBE_TOKEN`.
-
-**The history is gone (iPhone)**
-Safari deletes website data after 7 days of Safari use without visiting the site. Export the history from time to time (⚙︎ → `Verlauf exportieren`). A Home Screen web app keeps a separate history from the Safari tab; see [Using the web app on iPhone](#using-the-web-app-on-iphone).
+**The engine selection is missing in the settings**
+Only one engine is installed. On Apple Silicon, run `pip install mlx-whisper` in the virtual environment, or start `./transcribe.sh`, which installs it automatically.
 
 ## License
 
