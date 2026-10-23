@@ -122,12 +122,22 @@ engineSelect.addEventListener('change', () => {
 
 // Der Verlauf sind die gespeicherten .txt-Dateien; der Server liest sie aus dem Transkript-Ordner
 let history = [];
+let historySignature = null;
+const HISTORY_REFRESH = 5000;  // ms; übernimmt Änderungen am Ordner, z.B. im Finder gelöschte .txt
 
 async function loadHistory(freshId) {
   try {
     const response = await fetch('/transcripts');
-    if (response.ok) history = await response.json();
-  } catch {}
+    if (!response.ok) return;
+    const list = await response.json();
+    const signature = JSON.stringify(list);
+    // Unverändert: Liste nicht neu aufbauen, sonst klappen offene Karten zu und Markierungen gehen verloren
+    if (signature === historySignature && !freshId) return;
+    history = list;
+    historySignature = signature;
+  } catch {
+    return;
+  }
   renderHistory(freshId);
 }
 
@@ -518,9 +528,15 @@ async function init() {
 // Browser pausieren Hintergrund-Tabs; beim Zurückkehren offene Jobs wieder aufnehmen
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    loadHistory();  // im Finder gelöschte oder hinzugefügte .txt übernehmen
+    loadHistory();
     resumePending();
   }
 });
+
+// Ein Wechsel zum Finder und zurück macht das Fenster nicht unsichtbar, daher auch bei Fokus und regelmäßig
+window.addEventListener('focus', () => loadHistory());
+setInterval(() => {
+  if (document.visibilityState === 'visible') loadHistory();
+}, HISTORY_REFRESH);
 
 init();
