@@ -1,9 +1,7 @@
 const $ = (id) => document.getElementById(id);
 
-const HISTORY_KEY = 'transcripts';
 const PENDING_KEY = 'pendingJobs';
 const SETTINGS_KEY = 'settings';
-const HISTORY_MAX = 200;
 const PENDING_MAX_AGE = 2 * 60 * 60 * 1000;  // danach hat der Server das Ergebnis längst verworfen
 const MAX_RETRIES = 20;
 
@@ -56,6 +54,10 @@ const currentEngine = () => config.engines.find((e) => e.id === engineSelect.val
 function applyConfig() {
   engineSelect.replaceChildren(...config.engines.map((e) => option(e.id, e.label)));
   $('engineField').hidden = config.engines.length < 2;
+  // Die App speichert immer in ihrem eigenen Ordner und kann ihre Daten komplett löschen
+  $('outputFolderField').hidden = !!config.app;
+  $('resetBtn').hidden = !config.app;
+  if (config.output_dir) $('dataHint').textContent = `Transkripte: ${config.output_dir}`;
 }
 
 function fillModels() {
@@ -118,20 +120,20 @@ engineSelect.addEventListener('change', () => {
 
 // ---------- Verlauf ----------
 
-function getHistory() {
-  const list = store.get(HISTORY_KEY, []);
-  return Array.isArray(list) ? list : [];
+// Der Verlauf sind die gespeicherten .txt-Dateien; der Server liest sie aus dem Transkript-Ordner
+let history = [];
+
+async function loadHistory(freshId) {
+  try {
+    const response = await fetch('/transcripts');
+    if (response.ok) history = await response.json();
+  } catch {}
+  renderHistory(freshId);
 }
 
-function saveTranscript(entry) {
-  const list = getHistory().filter((t) => t.id !== entry.id);
-  list.unshift(entry);
-  return store.set(HISTORY_KEY, list.slice(0, HISTORY_MAX));
-}
-
-function deleteTranscript(id) {
-  store.set(HISTORY_KEY, getHistory().filter((t) => t.id !== id));
-  renderHistory();
+async function deleteTranscript(id) {
+  await fetch(`/transcripts?id=${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+  loadHistory();
 }
 
 function formatDate(iso) {
@@ -160,7 +162,7 @@ async function copyText(text, button) {
 }
 
 function renderHistory(freshId) {
-  const list = getHistory();
+  const list = history;
   $('emptyState').hidden = list.length > 0;
   $('historyCount').textContent = list.length ? `${list.length} gespeichert` : '';
   $('historyList').replaceChildren(...list.map((t) => {
@@ -174,11 +176,11 @@ function renderHistory(freshId) {
     when.className = 'when';
     when.textContent = [formatDate(t.date), formatDuration(t.duration)].filter(Boolean).join(' · ');
     meta.append(when);
-    if (t.fileName) {
+    if (t.file_name) {
       const file = document.createElement('span');
       file.className = 'file';
-      file.textContent = `· ${t.fileName}`;
-      file.title = t.fileName;
+      file.textContent = `· ${t.file_name}`;
+      file.title = t.file_name;
       meta.append(file);
     }
 
@@ -200,15 +202,15 @@ function renderHistory(freshId) {
       className: 'ghost-btn danger', type: 'button', textContent: 'Löschen',
     });
     del.addEventListener('click', () => {
-      if (confirm('Dieses Transkript löschen?')) deleteTranscript(t.id);
+      if (confirm('Dieses Transkript löschen? Die .txt-Datei wird mit gelöscht.')) deleteTranscript(t.id);
     });
     actions.append(copy, del);
 
     li.append(meta, text);
-    if (t.savedAs) {
+    if (t.saved_as && !config.app) {
       const saved = document.createElement('div');
       saved.className = 'card-saved';
-      saved.textContent = `Gespeichert als: ${t.savedAs}`;
+      saved.textContent = `Gespeichert als: ${t.saved_as}`;
       li.append(saved);
     }
     li.append(actions);
@@ -224,53 +226,35 @@ function renderHistory(freshId) {
   }
 }
 
-// ---------- Export / Import ----------
+// ---------- Daten ----------
 
-$('exportBtn').addEventListener('click', async () => {
-  const list = getHistory();
-  if (!list.length) { $('settingsMsg').textContent = 'Der Verlauf ist leer.'; return; }
-  const name = `transkripte-${new Date().toISOString().slice(0, 10)}.json`;
-  const data = JSON.stringify({ version: 1, exported_at: new Date().toISOString(), transcripts: list }, null, 2);
-  const file = new File([data], name, { type: 'application/json' });
-
-  // Auf dem iPhone über das Teilen-Menü (z.B. „In Dateien sichern“), sonst als Download
-  if (matchMedia('(pointer: coarse)').matches && navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file] }); return; }
-    catch (e) { if (e.name === 'AbortError') return; }
-  }
-  const url = URL.createObjectURL(file);
-  const a = Object.assign(document.createElement('a'), { href: url, download: name });
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+$('openFolderBtn').addEventListener('click', () => {
+  fetch('/open-folder', { method: 'POST' }).catch(() => {});
 });
 
-$('importInput').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  e.target.value = '';
-  if (!file) return;
+$('resetBtn').addEventListener('click', async () => {
+  const question = 'Alle App-Daten löschen?\n\n'
+    + 'Das löscht alle Transkripte, den Verlauf und das heruntergeladene Whisper-Modell (ca. 1,6 GB). '
+    + 'Das lässt sich nicht rückgängig machen.';
+  if (!confirm(question)) return;
   const msg = $('settingsMsg');
   msg.classList.remove('error');
   try {
-    const parsed = JSON.parse(await file.text());
-    const incoming = (Array.isArray(parsed) ? parsed : parsed.transcripts || [])
-      .filter((t) => t && typeof t.id === 'string' && typeof t.text === 'string');
-    const byId = new Map(getHistory().map((t) => [t.id, t]));
-    let added = 0;
-    for (const t of incoming) {
-      if (!byId.has(t.id)) added++;
-      byId.set(t.id, t);
+    const response = await fetch('/reset', { method: 'POST' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    for (const watcher of watchers.values()) {
+      if (watcher.es) watcher.es.close();
+      clearTimeout(watcher.timer);
     }
-    const merged = [...byId.values()]
-      .sort((a, b) => String(b.date).localeCompare(String(a.date)))
-      .slice(0, HISTORY_MAX);
-    if (!store.set(HISTORY_KEY, merged)) throw new Error('Speichern im Browser nicht möglich.');
-    renderHistory();
-    msg.textContent = `${added} Transkript(e) importiert.`;
+    watchers.clear();
+    jobsEl.replaceChildren();
+    try { localStorage.clear(); } catch {}
+    loadSettings();
+    loadHistory();
+    msg.textContent = 'Alle App-Daten wurden gelöscht. Du kannst Transcribe jetzt beenden und in den Papierkorb ziehen.';
   } catch (err) {
     msg.classList.add('error');
-    msg.textContent = `Import fehlgeschlagen: ${err.message}`;
+    msg.textContent = `Löschen fehlgeschlagen: ${err.message}`;
   }
 });
 
@@ -290,9 +274,8 @@ function removePending(id) {
 }
 
 function resumePending() {
-  const known = new Set(getHistory().map((t) => t.id));
   for (const job of getPending()) {
-    if (known.has(job.id) || Date.now() - job.startedAt > PENDING_MAX_AGE) {
+    if (Date.now() - job.startedAt > PENDING_MAX_AGE) {
       removePending(job.id);
     } else if (!watchers.has(job.id)) {
       watchJob(job);
@@ -391,39 +374,17 @@ function watchJob(job) {
         else if (msg.value > 0) status.detail(`Fortschritt: ${msg.value}%`);
         else status.detail('Modell wird geladen & Transkription läuft …');
       } else if (msg.type === 'done') {
+        // Der Server hat die .txt schon gespeichert; Ergebnis bestätigen und Verlauf neu laden
         stop();
-        const entry = {
-          id: job.id,
-          date: new Date().toISOString(),
-          fileName: job.fileName,
-          text: msg.text,
-          language: msg.language,
-          duration: msg.duration,
-          savedAs: msg.saved_as || undefined,
-        };
-        if (saveTranscript(entry)) {
-          removePending(job.id);
-          fetch(`/job?job=${encodeURIComponent(job.id)}`, { method: 'DELETE' }).catch(() => {});
-          status.el.remove();
-          renderHistory(job.id);
-        } else {
-          status.fail('Nicht gespeichert', 'Der Browser erlaubt keinen Speicher (privater Modus?). Text hier kopieren:');
-          const copy = Object.assign(document.createElement('button'), {
-            className: 'ghost-btn', type: 'button', textContent: 'Text kopieren',
-          });
-          copy.addEventListener('click', () => copyText(msg.text, copy));
-          status.el.append(copy);
-        }
+        removePending(job.id);
+        fetch(`/job?job=${encodeURIComponent(job.id)}`, { method: 'DELETE' }).catch(() => {});
+        status.el.remove();
+        loadHistory(msg.id);
       } else if (msg.type === 'error') {
         stop();
         removePending(job.id);
-        // Ein anderer Tab hat das Ergebnis schon abgeholt und gespeichert
-        if (msg.gone && getHistory().some((t) => t.id === job.id)) {
-          status.el.remove();
-          renderHistory();
-          return;
-        }
         status.fail('Fehler', msg.message);
+        if (msg.gone) loadHistory();  // z.B. in einem anderen Tab schon fertig geworden
       }
     };
 
@@ -544,7 +505,7 @@ async function init() {
   applyConfig();
   if (config.version) $('version').textContent = `Transcribe ${config.version}`;
   loadSettings();
-  renderHistory();
+  loadHistory();
 
   resumePending();
 
@@ -557,13 +518,9 @@ async function init() {
 // Browser pausieren Hintergrund-Tabs; beim Zurückkehren offene Jobs wieder aufnehmen
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    renderHistory();
+    loadHistory();  // im Finder gelöschte oder hinzugefügte .txt übernehmen
     resumePending();
   }
-});
-
-window.addEventListener('storage', (e) => {
-  if (e.key === HISTORY_KEY) renderHistory();
 });
 
 init();

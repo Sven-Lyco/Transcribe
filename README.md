@@ -15,9 +15,27 @@ Transcribe is available as a Mac app for **Apple Silicon (M1 or newer) with macO
 3. Open Transcribe. The app is not signed by Apple, so macOS blocks it the first time ("Apple could not verify …"). Click **Done**, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to Transcribe. This is needed only once.
 4. Drop an audio file into the window.
 
-The first transcription downloads the Whisper model (about 1.6 GB, cached in `~/.cache/huggingface` and shared with the script version). The app saves transcriptions in `~/Documents/Transkripte` and writes its log to `~/Library/Logs/Transcribe/transcribe.log`.
+The first transcription downloads the Whisper model (about 1.6 GB). The history (`Verlauf`) in the window shows all transcriptions; each one is also saved as a `.txt` file. Settings (⚙︎) → `Ordner öffnen` shows these files in Finder.
+
+All app data lives in one folder, `~/Library/Application Support/Transcribe`:
+
+| Folder or file   | Content                                  |
+|------------------|------------------------------------------|
+| `Transkripte/`   | Transcriptions as `.txt`, plus the index of the history |
+| `huggingface/`   | Downloaded Whisper models                |
+| `cache/`         | Compiled code cache, if one is needed    |
+| `transcribe.log` | Log file                                 |
 
 On Intel Macs, Windows, and Linux, use the script version described under [Setup & Usage](#setup--usage).
+
+### Uninstalling the app
+
+macOS does not remove an app's data when you move the app to the Trash. To remove everything:
+
+1. In Transcribe, open the settings (⚙︎) and click `Alle App-Daten löschen …`. This deletes all transcriptions, the history, and the downloaded model.
+2. Quit Transcribe and move it from **Applications** to the Trash.
+
+The window settings (engine, model, language) remain as a few hundred KB of WebKit data in `~/Library/WebKit/io.github.sven-lyco.transcribe` and `~/Library/Caches/io.github.sven-lyco.transcribe`; you can delete these folders too.
 
 ## Features
 
@@ -27,7 +45,7 @@ On Intel Macs, Windows, and Linux, use the script version described under [Setup
 - Language selection (German, English, auto-detect)
 - Optional speaker name prefix in output
 - Timestamp extracted automatically from filename (WhatsApp format supported)
-- History of past transcriptions in the browser, with copy, delete, export, and import
+- History of past transcriptions with copy and delete, based on the saved `.txt` files
 - Saves each transcription as a `.txt` file in `transcriptions/` or in a folder of your choice
 - Works on macOS, Windows, and Linux
 - GPU acceleration when available (Apple Silicon via MLX or MPS, CUDA), CPU fallback otherwise
@@ -88,6 +106,8 @@ To stop a transcription, click `Abbrechen` below its progress bar. Whisper works
 
 The result appears in the history (`Verlauf`) on the page and is saved as a `.txt` file named after the audio file. By default it goes to the `transcriptions/` folder inside the project directory. To save it elsewhere, enter the full path of an existing folder in `Ausgabeordner` (`~` is supported). An existing `.txt` with the same name is overwritten.
 
+The history lists the `.txt` files in the `transcriptions/` folder and those saved elsewhere through `Ausgabeordner`. Deleting an entry in the history also deletes its `.txt` file; a file deleted in Finder disappears from the history.
+
 ### Custom port
 
 The web UI uses port `8765` by default. Pass `--port` (or `-p`) to use a different one:
@@ -130,7 +150,7 @@ Both engines use the same Whisper models from OpenAI, so their results are compa
 | medium         | ~1.4 GB  | Very good   |
 | large-v3-turbo | ~1.6 GB  | Best        |
 
-A model is downloaded automatically the first time you use it. openai-whisper caches its models in `~/.cache/whisper`, mlx-whisper in `~/.cache/huggingface`.
+A model is downloaded automatically the first time you use it. openai-whisper caches its models in `~/.cache/whisper`, mlx-whisper in `~/.cache/huggingface`. The Mac app keeps its models in its own data folder.
 
 ## Output Format
 

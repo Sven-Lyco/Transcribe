@@ -38,14 +38,14 @@
       </div>
     </div>
     <div class="hint" id="modelHint"></div>
-    <div class="field">
+    <div class="field" id="outputFolderField">
       <label for="outputFolder">Ausgabeordner</label>
       <input type="text" id="outputFolder" placeholder="Pfad zum Zielordner (leer = transcriptions/)">
     </div>
+    <div class="hint" id="dataHint"></div>
     <div class="row">
-      <button class="ghost-btn" id="exportBtn" type="button">Verlauf exportieren</button>
-      <label class="button ghost-btn" for="importInput">Verlauf importieren</label>
-      <input type="file" id="importInput" accept="application/json,.json" hidden>
+      <button class="ghost-btn" id="openFolderBtn" type="button">Ordner öffnen</button>
+      <button class="ghost-btn danger" id="resetBtn" type="button" hidden>Alle App-Daten löschen …</button>
     </div>
     <div class="hint" id="settingsMsg"></div>
   </section>

@@ -11,14 +11,15 @@ import sys
 import threading
 from pathlib import Path
 
-HOME = Path.home()
-SUPPORT_DIR = HOME / "Library" / "Application Support" / "Transcribe"
-LOG_FILE = HOME / "Library" / "Logs" / "Transcribe" / "transcribe.log"
+# Alle Daten der App liegen in einem Ordner: Transkripte, Verlauf, Modelle, Caches und Log.
+# So kann „Alle App-Daten löschen“ sie vor dem Deinstallieren gesammelt entfernen.
+DATA_DIR = Path.home() / "Library" / "Application Support" / "Transcribe"
+LOG_FILE = DATA_DIR / "transcribe.log"
 
-# Muss vor dem Import von transcribe (und damit numba) gesetzt sein:
-# Das App-Bundle ist schreibgeschützt, Transkripte und numba-Cache brauchen einen anderen Ort.
-os.environ.setdefault("TRANSCRIBE_OUTPUT_DIR", str(HOME / "Documents" / "Transkripte"))
-os.environ.setdefault("NUMBA_CACHE_DIR", str(HOME / "Library" / "Caches" / "Transcribe" / "numba"))
+# Muss vor dem Import von transcribe, numba und huggingface_hub gesetzt sein
+os.environ.setdefault("TRANSCRIBE_DATA_DIR", str(DATA_DIR))
+os.environ.setdefault("HF_HOME", str(DATA_DIR / "huggingface"))  # Whisper-Modelle
+os.environ.setdefault("NUMBA_CACHE_DIR", str(DATA_DIR / "cache" / "numba"))  # das App-Bundle ist schreibgeschützt
 
 # Die App bringt ein eigenes FFmpeg mit (packaging/macos/build_ffmpeg.sh)
 if getattr(sys, "frozen", False):
@@ -65,9 +66,8 @@ def main():
     webview.create_window(
         "Transcribe", url, width=760, height=900, min_size=(520, 600), background_color="#0f0f0f",
     )
-    SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-    # private_mode=False, sonst löscht pywebview den localStorage (und damit den Verlauf) bei jedem Start
-    webview.start(private_mode=False, storage_path=str(SUPPORT_DIR / "webview"))
+    # private_mode=False, sonst löscht pywebview den localStorage (Einstellungen) bei jedem Start
+    webview.start(private_mode=False)
 
     # Fenster geschlossen: App beenden
     httpd.shutdown()

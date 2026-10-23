@@ -32,6 +32,7 @@ import time
 import uuid
 import webbrowser
 import glob
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -81,8 +82,12 @@ MAX_FILE_NAME = 200
 # In der Mac-App (PyInstaller) liegen die Dateien unter sys._MEIPASS
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 STATIC_DIR = BASE_DIR / "static"
-# Die Mac-App setzt einen beschreibbaren Ordner, das App-Bundle selbst ist schreibgeschützt
-DEFAULT_OUTPUT_DIR = Path(os.environ.get("TRANSCRIBE_OUTPUT_DIR") or Path(__file__).parent / "transcriptions")
+# Die Mac-App legt alle ihre Daten in einen eigenen Ordner (TRANSCRIBE_DATA_DIR), damit
+# „Alle App-Daten löschen“ sie gesammelt entfernen kann. Das Skript speichert im Projektordner.
+APP_DATA_DIR = Path(os.environ["TRANSCRIBE_DATA_DIR"]) if os.environ.get("TRANSCRIBE_DATA_DIR") else None
+DEFAULT_OUTPUT_DIR = APP_DATA_DIR / "Transkripte" if APP_DATA_DIR else Path(__file__).parent / "transcriptions"
+# Merkt sich zu jedem Transkript Datum, Dauer und Originaldatei für den Verlauf
+HISTORY_INDEX = DEFAULT_OUTPUT_DIR / ".verlauf.json"
 # Ausgelieferte Dateien: Pfad -> (Datei, Content-Type)
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -139,6 +144,8 @@ _engines: dict = {}
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 _tqdm_local = threading.local()
+
+_history_lock = threading.Lock()
 
 _models: dict = {}  # zuletzt benutztes openai-whisper-Modell; mlx-whisper hält seins selbst
 _transcribe_lock = threading.Lock()  # immer nur eine Transkription, sonst bremsen sich die Jobs aus
@@ -315,6 +322,7 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
             save_dir.mkdir(parents=True, exist_ok=True)
         txt_path = save_dir / (Path(file_name).stem + ".txt")
         txt_path.write_text(formatted_text, encoding="utf-8")
+        transcript_id = _add_to_history(txt_path, file_name, lang, duration)
         print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
 
         with _jobs_lock:
@@ -324,6 +332,7 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
                     "done": True,
                     "finished_at": time.time(),
                     "result": {
+                        "id": transcript_id,
                         "text": formatted_text,
                         "language": lang,
                         "duration": duration,
@@ -343,6 +352,113 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
                 _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
     finally:
         os.unlink(tmp_path)
+
+
+def _load_history_index():
+    try:
+        return json.loads(HISTORY_INDEX.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_history_index(index):
+    HISTORY_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    tmp = HISTORY_INDEX.with_suffix(".tmp")
+    tmp.write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(HISTORY_INDEX)
+
+
+def _add_to_history(txt_path, file_name, language, duration):
+    """Trägt ein gespeichertes Transkript in den Verlauf ein und gibt seine ID zurück."""
+    transcript_id = uuid.uuid4().hex
+    with _history_lock:
+        # Gleicher Dateiname überschreibt die .txt, dann auch den alten Eintrag ersetzen
+        index = {k: v for k, v in _load_history_index().items() if v.get("path") != str(txt_path)}
+        index[transcript_id] = {
+            "path": str(txt_path),
+            "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "file_name": file_name,
+            "language": language,
+            "duration": duration,
+        }
+        _save_history_index(index)
+    return transcript_id
+
+
+def _list_history():
+    """Alle vorhandenen Transkripte, neueste zuerst.
+
+    Grundlage sind die .txt-Dateien: Im Finder gelöschte verschwinden aus dem Verlauf, und
+    .txt im Standardordner ohne Eintrag (z.B. ältere) erscheinen mit dem Datum der Datei.
+    """
+    with _history_lock:
+        index = _load_history_index()
+    entries, seen = [], set()
+    for transcript_id, meta in index.items():
+        path = Path(meta.get("path", ""))
+        if path.is_file():
+            entries.append({**meta, "id": transcript_id})
+            seen.add(path.resolve())
+    if DEFAULT_OUTPUT_DIR.is_dir():
+        for path in DEFAULT_OUTPUT_DIR.glob("*.txt"):
+            if path.resolve() not in seen:
+                entries.append({
+                    "id": "file:" + path.name,
+                    "path": str(path),
+                    "date": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+                    "file_name": path.name,
+                })
+    for entry in entries:
+        try:
+            entry["text"] = Path(entry["path"]).read_text(encoding="utf-8")
+        except OSError:
+            entry["text"] = ""
+        entry["saved_as"] = entry.pop("path")
+    return sorted(entries, key=lambda e: e["date"], reverse=True)
+
+
+def _delete_from_history(transcript_id):
+    """Löscht das Transkript samt .txt-Datei. Gibt False zurück, wenn es nicht existiert."""
+    with _history_lock:
+        index = _load_history_index()
+        if transcript_id in index:
+            path = Path(index.pop(transcript_id)["path"])
+            _save_history_index(index)
+        elif transcript_id.startswith("file:"):
+            name = transcript_id[len("file:"):]
+            if Path(name).name != name or not name.endswith(".txt"):
+                return False  # nur Dateien direkt im Standardordner
+            path = DEFAULT_OUTPUT_DIR / name
+        else:
+            return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _open_in_file_manager(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(folder)])
+    elif sys.platform == "win32":
+        os.startfile(folder)
+    else:
+        subprocess.run(["xdg-open", str(folder)])
+
+
+def _reset_app_data():
+    """Löscht alles im App-Datenordner: Transkripte, Verlauf, Modelle, Caches, Log."""
+    with _jobs_lock:
+        _jobs.clear()  # laufende Transkriptionen brechen beim nächsten Abschnitt ab
+    with _history_lock:
+        for child in APP_DATA_DIR.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+    print("  Alle App-Daten gelöscht")
 
 
 def _prune_jobs():
@@ -410,7 +526,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "default_engine": next(iter(_engines)),
                 "languages": LANGUAGES,
                 "version": VERSION,
+                "app": APP_DATA_DIR is not None,
+                "output_dir": str(DEFAULT_OUTPUT_DIR).replace(str(Path.home()), "~", 1),
             })
+            return
+
+        if parsed.path == "/transcripts":
+            self._json_response(_list_history())
             return
 
         if parsed.path in STATIC_FILES:
@@ -485,6 +607,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(403)
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/transcripts":
+            transcript_id = parse_qs(parsed.query).get("id", [""])[0]
+            self.send_response(204 if _delete_from_history(transcript_id) else 404)
+            self.end_headers()
+            return
         if parsed.path != "/job":
             self.send_error(404)
             return
@@ -497,6 +624,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._is_local_request():
             self.send_error(403)
+            return
+
+        if self.path == "/open-folder":
+            _open_in_file_manager(DEFAULT_OUTPUT_DIR)
+            self._json_response({"ok": True})
+            return
+
+        if self.path == "/reset" and APP_DATA_DIR:
+            _reset_app_data()
+            self._json_response({"ok": True})
             return
 
         if self.path != "/transcribe":
@@ -571,7 +708,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_response({"error": f"Unbekannte Sprache. Erlaubt: {', '.join(LANGUAGES)}"}, status=400)
             return
 
-        if output_folder:
+        if APP_DATA_DIR:
+            output_folder = ""  # die App speichert immer in ihrem eigenen Ordner
+        elif output_folder:
             output_dir = Path(output_folder).expanduser()
             if not output_dir.is_dir():
                 self._json_response({"error": f"Ausgabeordner nicht gefunden: {output_folder}"})
