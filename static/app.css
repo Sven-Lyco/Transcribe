@@ -304,6 +304,8 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
 
 .status.failed { border-left-color: var(--danger); }
 
+.status.offline { margin-top: 1.5rem; }
+
 .status .progress {
   color: var(--accent);
   margin-bottom: 0.3rem;

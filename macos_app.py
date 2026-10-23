@@ -62,15 +62,16 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     threading.Thread(target=transcribe._prune_jobs_forever, daemon=True).start()
 
-    webview.settings["ALLOW_DOWNLOADS"] = True  # für „Verlauf exportieren“
     webview.create_window(
         "Transcribe", url, width=760, height=900, min_size=(520, 600), background_color="#0f0f0f",
     )
     # private_mode=False, sonst löscht pywebview den localStorage (Einstellungen) bei jedem Start
     webview.start(private_mode=False)
 
-    # Fenster geschlossen: App beenden
+    # Fenster geschlossen: App beenden. os._exit, damit kein Hintergrund-Thread einer Bibliothek
+    # den Prozess ohne Fenster und ohne Server am Leben hält.
     httpd.shutdown()
+    os._exit(0)
 
 
 if __name__ == "__main__":

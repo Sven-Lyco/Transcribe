@@ -125,9 +125,15 @@ let history = [];
 let historySignature = null;
 const HISTORY_REFRESH = 5000;  // ms; übernimmt Änderungen am Ordner, z.B. im Finder gelöschte .txt
 
+// Ohne Server zeigt die Seite nur noch den letzten Stand; das soll man sehen statt still nichts passiert
+function setOffline(offline) {
+  $('offline').hidden = !offline;
+}
+
 async function loadHistory(freshId) {
   try {
     const response = await fetch('/transcripts');
+    setOffline(false);
     if (!response.ok) return;
     const list = await response.json();
     const signature = JSON.stringify(list);
@@ -136,13 +142,21 @@ async function loadHistory(freshId) {
     history = list;
     historySignature = signature;
   } catch {
+    setOffline(true);
     return;
   }
   renderHistory(freshId);
 }
 
 async function deleteTranscript(id) {
-  await fetch(`/transcripts?id=${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+  try {
+    const response = await fetch(`/transcripts?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    // 404: schon weg, z.B. im Finder gelöscht; dann reicht neu laden
+    if (!response.ok && response.status !== 404) throw new Error(`HTTP ${response.status}`);
+  } catch (err) {
+    // fetch meldet fehlende Verbindung als TypeError
+    createStatus().fail('Löschen fehlgeschlagen', err instanceof TypeError ? 'Keine Verbindung zum Transcribe-Server.' : err.message);
+  }
   loadHistory();
 }
 
