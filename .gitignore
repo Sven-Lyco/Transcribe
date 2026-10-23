@@ -10,3 +10,4 @@ transcriptions/*
 # Mac-App (packaging/macos/build.sh)
 build/
 dist/
+ffbuild/
