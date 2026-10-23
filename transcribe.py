@@ -125,6 +125,7 @@ HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Whisper Transkription</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎙️</text></svg>">
 <style>
   :root {
     --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -631,14 +632,21 @@ def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, out
             device = "cpu"
 
         print(f"  → Lade Modell '{model_name}'...")
-        model = whisper.load_model(model_name, device=device)
+        # Auf CPU laden und alignment_heads (sparse Tensor) in dense umwandeln,
+        # da MPS keine sparse Tensoren unterstützt (siehe pytorch/pytorch#78168).
+        model = whisper.load_model(model_name, device="cpu")
+        if device != "cpu":
+            model.alignment_heads = model.alignment_heads.to_dense()
+            model = model.to(device)
 
         print(f"  → Transkribiere '{file_name}'...")
         kwargs = {"verbose": False}
         if language != "auto":
             kwargs["language"] = language
 
-        result = model.transcribe(tmp_path, fp16=(device != "cpu"), **kwargs)
+        # fp16 nur auf CUDA aktivieren: Apples MPS-Backend liefert bei manchen
+        # Whisper-Modellen in fp16 NaN-Logits, daher dort auf fp32 bleiben.
+        result = model.transcribe(tmp_path, fp16=(device == "cuda"), **kwargs)
         text = result["text"].strip()
         lang = result.get("language", "?")
 
