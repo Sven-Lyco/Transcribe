@@ -125,6 +125,32 @@ h1 {
   color: var(--accent);
   font-family: var(--mono);
   word-break: break-all;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.file-info:empty { display: none; }
+
+/* liegt über dem unsichtbaren Dateifeld, das die ganze Ablagefläche überdeckt */
+.file-remove {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.15rem 0.5rem;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.file-remove:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+  opacity: 1;
 }
 
 .row {

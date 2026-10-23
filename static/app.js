@@ -464,13 +464,30 @@ dropZone.addEventListener('drop', (e) => {
 function selectFile(file) {
   selectedFile = file;
   const mb = (file.size / 1024 / 1024).toFixed(1);
-  $('fileInfo').textContent = `${file.name} (${mb} MB)`;
+  const name = document.createElement('span');
+  name.textContent = `${file.name} (${mb} MB)`;
+  const remove = Object.assign(document.createElement('button'), {
+    type: 'button', className: 'file-remove', textContent: '✕', title: 'Auswahl entfernen',
+  });
+  remove.setAttribute('aria-label', 'Auswahl entfernen');
+  remove.addEventListener('click', (e) => {
+    e.stopPropagation();  // sonst öffnet sich die Dateiauswahl der Ablagefläche
+    clearSelection();
+  });
+  $('fileInfo').replaceChildren(name, remove);
   startBtn.disabled = false;
   // file.path is available in some local/Electron environments
   if (file.path) {
     const sep = file.path.includes('/') ? '/' : '\\';
     outputFolderInput.value = file.path.substring(0, file.path.lastIndexOf(sep));
   }
+}
+
+function clearSelection() {
+  selectedFile = null;
+  fileInput.value = '';
+  $('fileInfo').replaceChildren();
+  startBtn.disabled = true;
 }
 
 startBtn.addEventListener('click', async () => {
@@ -508,9 +525,7 @@ startBtn.addEventListener('click', async () => {
     const job = { id: data.job_id, fileName: file.name, startedAt: Date.now() };
     addPending(job);
     watchJob(job);
-    selectedFile = null;
-    fileInput.value = '';
-    $('fileInfo').textContent = '';
+    clearSelection();
     speakerNameInput.value = '';
   } catch (err) {
     if (err.name === 'AbortError') upload.el.remove();
