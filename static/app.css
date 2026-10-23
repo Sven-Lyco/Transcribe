@@ -447,11 +447,12 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
   transition: background-color 0.15s, color 0.15s;
 }
 
-.seg:hover { background: rgba(232, 255, 90, 0.12); }
+.seg:hover { background: rgba(232, 255, 90, 0.08); }
 
+/* Akzentfarbe als Schrift statt als Fläche, damit der Text gut lesbar bleibt */
 .seg.spoken {
-  background: var(--accent);
-  color: #0f0f0f;
+  background: rgba(232, 255, 90, 0.14);
+  color: var(--accent);
 }
 
 .player {
