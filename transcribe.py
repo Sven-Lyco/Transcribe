@@ -1,26 +1,34 @@
 """
-Lokales Whisper Transkriptions-Tool
-====================================
-Einmalige Installation (einmal ausführen):
+Whisper Transkriptions-Tool
+===========================
+Lokal (Standard):
     pip install openai-whisper
-
-Danach einfach starten:
     python transcribe.py
 
-Öffnet dann automatisch http://127.0.0.1:8765 im Browser.
+    Öffnet dann automatisch http://127.0.0.1:8765 im Browser.
 
-Anderer Port:
-    python transcribe.py --port 9000
+    Anderer Port:
+        python transcribe.py --port 9000
+
+Gehostet (z.B. Docker/Coolify, siehe Dockerfile):
+    pip install faster-whisper
+    TRANSCRIBE_HOSTED=1 TRANSCRIBE_TOKEN=<geheim> python transcribe.py
+
+    Lauscht auf allen Interfaces, verlangt das Token beim Upload und
+    speichert keine Transkripte auf dem Server.
 """
 
 import argparse
 import errno
+import hmac
 import http.server
 import socketserver
 import json
 import os
+import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,7 +39,10 @@ import glob
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-HOST = "127.0.0.1"
+HOSTED = os.environ.get("TRANSCRIBE_HOSTED") == "1"
+TOKEN = os.environ.get("TRANSCRIBE_TOKEN", "")
+
+HOST = "0.0.0.0" if HOSTED else "127.0.0.1"
 DEFAULT_PORT = 8765
 PORT_SUGGESTIONS = 3  # Anzahl freier Ports, die bei belegtem Port angeboten werden
 # Ports, die Browser nicht öffnen (ERR_UNSAFE_PORT)
@@ -42,8 +53,31 @@ BROWSER_BLOCKED_PORTS = frozenset({
     587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060,
     5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
 })
-MODELS = ("tiny", "base", "small", "medium")
+# Gehostet läuft faster-whisper auf der CPU; tiny/base lohnen sich dort nicht.
+MODELS = ("small", "medium", "large-v3-turbo") if HOSTED else ("tiny", "base", "small", "medium")
+DEFAULT_MODEL = os.environ.get("TRANSCRIBE_MODEL", "large-v3-turbo" if HOSTED else "medium")
 LANGUAGES = ("de", "en", "auto")
+
+JOB_TTL = 3600  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Speicher bleibt
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # nur gehostet
+
+STATIC_DIR = Path(__file__).parent / "static"
+# Ausgelieferte Dateien: Pfad -> (Datei, Content-Type, Cache-Control)
+STATIC_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json", "no-cache"),
+    "/sw.js": ("sw.js", "text/javascript; charset=utf-8", "no-cache"),
+    "/icon.svg": ("icon.svg", "image/svg+xml", "max-age=86400"),
+    "/icon-192.png": ("icon-192.png", "image/png", "max-age=86400"),
+    "/icon-512.png": ("icon-512.png", "image/png", "max-age=86400"),
+    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png", "max-age=86400"),
+}
+# Die Seite lädt nichts von fremden Servern
+CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
 
 # ffmpeg automatisch finden (PATH, Windows WinGet + macOS Homebrew)
 def find_and_add_ffmpeg():
@@ -82,16 +116,39 @@ def find_and_add_ffmpeg():
     return False
 
 
-whisper = None  # wird erst in load_whisper() importiert, damit --help nicht auf den Import wartet
+# werden erst in load_whisper() importiert, damit --help nicht auf den Import wartet
+whisper = None
+WhisperModel = None
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 _tqdm_local = threading.local()
 
+_models: dict = {}  # zuletzt benutztes Modell, bleibt zwischen den Jobs geladen
+_transcribe_lock = threading.Lock()  # immer nur eine Transkription, sonst bremsen sich die Jobs aus
+
+
+def _set_progress(job_id, pct):
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["progress"] = max(0, min(99, int(pct)))
+
 
 def load_whisper():
-    """Importiert Whisper und leitet dessen Fortschrittsbalken an den laufenden Job weiter."""
-    global whisper
+    """Importiert die Whisper-Engine des aktuellen Modus."""
+    global whisper, WhisperModel
+    if HOSTED:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            print("=" * 50)
+            print("faster-whisper ist nicht installiert.")
+            print("Bitte einmalig ausführen:")
+            print("    pip install faster-whisper")
+            print("=" * 50)
+            sys.exit(1)
+        return
+
     try:
         import whisper
         import tqdm as _tqdm_module
@@ -103,6 +160,7 @@ def load_whisper():
         print("=" * 50)
         sys.exit(1)
 
+    # Fortschrittsbalken von openai-whisper an den laufenden Job weiterleiten
     _orig_tqdm = _tqdm_module.tqdm
 
     class _ProgressTqdm(_orig_tqdm):
@@ -110,519 +168,22 @@ def load_whisper():
             result = super().update(n)
             job_id = getattr(_tqdm_local, "job_id", None)
             if job_id and self.total and self.total > 0:
-                pct = min(99, int(self.n / self.total * 100))
-                with _jobs_lock:
-                    if job_id in _jobs:
-                        _jobs[job_id]["progress"] = pct
+                _set_progress(job_id, self.n / self.total * 100)
             return result
 
     _tqdm_module.tqdm = _ProgressTqdm
 
 
-HTML = """<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Whisper Transkription</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎙️</text></svg>">
-<style>
-  :root {
-    --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
-    --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-    --bg: #0f0f0f;
-    --surface: #1a1a1a;
-    --border: #2a2a2a;
-    --accent: #e8ff5a;
-    --text: #e0e0e0;
-    --muted: #666;
-    --radius: 4px;
-  }
-
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    font-weight: 300;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 2rem;
-  }
-
-  .container {
-    width: 100%;
-    max-width: 680px;
-  }
-
-  h1 {
-    font-family: var(--mono);
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: var(--accent);
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    margin-bottom: 0.4rem;
-  }
-
-  .subtitle {
-    color: var(--muted);
-    font-size: 0.85rem;
-    margin-bottom: 2.5rem;
-    font-family: var(--mono);
-  }
-
-  .drop-zone {
-    border: 1px dashed var(--border);
-    border-radius: var(--radius);
-    padding: 3rem 2rem;
-    text-align: center;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    background: var(--surface);
-    position: relative;
-  }
-
-  .drop-zone:hover, .drop-zone.dragover {
-    border-color: var(--accent);
-    background: #1f1f1f;
-  }
-
-  .drop-zone input[type="file"] {
-    position: absolute;
-    inset: 0;
-    opacity: 0;
-    cursor: pointer;
-    width: 100%;
-    height: 100%;
-  }
-
-  .drop-icon {
-    font-size: 2rem;
-    margin-bottom: 1rem;
-    display: block;
-  }
-
-  .drop-text {
-    font-size: 0.9rem;
-    color: var(--muted);
-  }
-
-  .drop-text strong {
-    color: var(--text);
-    font-weight: 600;
-  }
-
-  .file-info {
-    margin-top: 0.75rem;
-    font-size: 0.8rem;
-    color: var(--accent);
-    font-family: var(--mono);
-  }
-
-  .settings {
-    margin-top: 1.5rem;
-    display: flex;
-    gap: 1rem;
-    align-items: flex-end;
-  }
-
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    flex: 1;
-  }
-
-  label {
-    font-size: 0.75rem;
-    color: var(--muted);
-    font-family: var(--mono);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-
-  select {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 0.6rem 0.75rem;
-    border-radius: var(--radius);
-    font-family: var(--sans);
-    font-size: 0.9rem;
-    appearance: none;
-    cursor: pointer;
-    transition: border-color 0.2s;
-  }
-
-  select:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-
-  input[type="text"] {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 0.6rem 0.75rem;
-    border-radius: var(--radius);
-    font-family: var(--sans);
-    font-size: 0.9rem;
-    transition: border-color 0.2s;
-    width: 100%;
-  }
-
-  input[type="text"]:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-
-  input[type="text"]::placeholder {
-    color: var(--muted);
-  }
-
-  button {
-    background: var(--accent);
-    color: #0f0f0f;
-    border: none;
-    padding: 0.65rem 1.5rem;
-    border-radius: var(--radius);
-    font-family: var(--mono);
-    font-weight: 600;
-    font-size: 0.85rem;
-    cursor: pointer;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    transition: opacity 0.2s;
-    white-space: nowrap;
-  }
-
-  button:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.3; cursor: not-allowed; }
-
-  .status {
-    margin-top: 1.5rem;
-    padding: 1rem;
-    background: var(--surface);
-    border-left: 3px solid var(--accent);
-    border-radius: 0 var(--radius) var(--radius) 0;
-    font-family: var(--mono);
-    font-size: 0.82rem;
-    color: var(--text);
-    display: none;
-  }
-
-  .status.visible { display: block; }
-
-  .status .progress {
-    color: var(--accent);
-    margin-bottom: 0.3rem;
-  }
-
-  .result {
-    margin-top: 1.5rem;
-    display: none;
-  }
-
-  .result.visible { display: block; }
-
-  .result-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 0.75rem;
-  }
-
-  .result-label {
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-  }
-
-  .copy-btn {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 0.3rem 0.75rem;
-    font-size: 0.75rem;
-  }
-
-  .copy-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    opacity: 1;
-  }
-
-  textarea {
-    width: 100%;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 1rem;
-    border-radius: var(--radius);
-    font-family: var(--sans);
-    font-size: 0.9rem;
-    line-height: 1.6;
-    resize: vertical;
-    min-height: 160px;
-  }
-
-  textarea:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-
-  .model-hint {
-    margin-top: 0.4rem;
-    font-size: 0.75rem;
-    color: var(--muted);
-    font-family: var(--mono);
-  }
-
-  .prog-bar {
-    margin-top: 0.75rem;
-    height: 3px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-    display: none;
-  }
-
-  .prog-fill {
-    height: 100%;
-    background: var(--accent);
-    width: 0%;
-    transition: width 0.4s ease;
-  }
-
-  .spinner {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--accent);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-right: 0.5rem;
-    vertical-align: middle;
-  }
-
-  @keyframes spin { to { transform: rotate(360deg); } }
-</style>
-</head>
-<body>
-<div class="container">
-  <h1>Whisper Transkription</h1>
-  <p class="subtitle">// lokal · kein API-Key · kein Internet</p>
-
-  <div class="drop-zone" id="dropZone">
-    <input type="file" id="fileInput" accept="audio/*,.ogg,.mp3,.wav,.m4a,.opus,.webm">
-    <span class="drop-icon">🎙</span>
-    <div class="drop-text"><strong>Audiodatei hierher ziehen</strong><br>oder klicken zum Auswählen</div>
-    <div class="file-info" id="fileInfo"></div>
-  </div>
-
-  <div class="settings">
-    <div class="field">
-      <label>Modell</label>
-      <select id="model">
-        <option value="tiny">tiny — schnell, ~75 MB</option>
-        <option value="base">base — gut, ~140 MB</option>
-        <option value="small">small — besser, ~460 MB</option>
-        <option value="medium" selected>medium — sehr gut, ~1,4 GB</option>
-      </select>
-      <div class="model-hint" id="modelHint">Beim ersten Mal wird das Modell heruntergeladen.</div>
-    </div>
-    <div class="field" style="flex:0">
-      <label>Sprache</label>
-      <select id="language">
-        <option value="de" selected>Deutsch</option>
-        <option value="en">English</option>
-        <option value="auto">Auto-detect</option>
-      </select>
-    </div>
-    <button id="startBtn" disabled>Starten</button>
-  </div>
-
-  <div class="settings" style="margin-top: 0.75rem;">
-    <div class="field">
-      <label>Name (optional)</label>
-      <input type="text" id="speakerName" placeholder="z.B. Max Mustermann">
-    </div>
-    <div class="field">
-      <label>Ausgabeordner</label>
-      <input type="text" id="outputFolder" placeholder="Pfad zum Zielordner (leer = transcriptions/)">
-    </div>
-  </div>
-
-  <div class="status" id="status">
-    <div class="progress" id="statusText"><span class="spinner"></span> Wird verarbeitet...</div>
-    <div id="statusDetail"></div>
-    <div class="prog-bar" id="progBar"><div class="prog-fill" id="progFill"></div></div>
-  </div>
-
-  <div class="result" id="result">
-    <div class="result-header">
-      <span class="result-label">Transkription</span>
-      <button class="copy-btn" id="copyBtn">Kopieren</button>
-    </div>
-    <textarea id="transcript" readonly></textarea>
-  </div>
-</div>
-
-<script>
-  const dropZone = document.getElementById('dropZone');
-  const fileInput = document.getElementById('fileInput');
-  const fileInfo = document.getElementById('fileInfo');
-  const startBtn = document.getElementById('startBtn');
-  const status = document.getElementById('status');
-  const statusText = document.getElementById('statusText');
-  const statusDetail = document.getElementById('statusDetail');
-  const progBar = document.getElementById('progBar');
-  const progFill = document.getElementById('progFill');
-  const result = document.getElementById('result');
-  const transcript = document.getElementById('transcript');
-  const copyBtn = document.getElementById('copyBtn');
-  const modelSelect = document.getElementById('model');
-  const speakerNameInput = document.getElementById('speakerName');
-  const outputFolderInput = document.getElementById('outputFolder');
-  const modelHints = {
-    tiny: 'Schnellste Option — für kurze Nachrichten gut geeignet.',
-    base: 'Gute Balance aus Geschwindigkeit und Qualität.',
-    small: 'Bessere Genauigkeit, dauert etwas länger.',
-    medium: 'Sehr hohe Genauigkeit — empfohlen für Dialekt/Umgangssprache.'
-  };
-
-  modelSelect.addEventListener('change', () => {
-    document.getElementById('modelHint').textContent =
-      'Beim ersten Mal wird das Modell heruntergeladen. ' + modelHints[modelSelect.value];
-  });
-
-  let selectedFile = null;
-
-  fileInput.addEventListener('change', (e) => {
-    if (e.target.files[0]) selectFile(e.target.files[0]);
-  });
-
-  dropZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    dropZone.classList.add('dragover');
-  });
-
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-
-  dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    if (e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]);
-  });
-
-  function selectFile(file) {
-    selectedFile = file;
-    const mb = (file.size / 1024 / 1024).toFixed(1);
-    fileInfo.textContent = `${file.name} (${mb} MB)`;
-    startBtn.disabled = false;
-    result.classList.remove('visible');
-    status.classList.remove('visible');
-    // file.path is available in some local/Electron environments
-    if (file.path) {
-      const sep = file.path.includes('/') ? '/' : '\\\\';
-      outputFolderInput.value = file.path.substring(0, file.path.lastIndexOf(sep));
-    }
-  }
-
-  startBtn.addEventListener('click', async () => {
-    if (!selectedFile) return;
-
-    startBtn.disabled = true;
-    status.classList.add('visible');
-    statusText.innerHTML = '<span class="spinner"></span> Datei wird übertragen...';
-    statusDetail.textContent = '';
-    progFill.style.width = '0%';
-    progBar.style.display = 'none';
-    result.classList.remove('visible');
-
-    const formData = new FormData();
-    formData.append('file', selectedFile);
-    formData.append('model', modelSelect.value);
-    formData.append('language', document.getElementById('language').value);
-    formData.append('speaker_name', speakerNameInput.value.trim());
-    formData.append('output_folder', outputFolderInput.value.trim());
-
-    try {
-      const response = await fetch('/transcribe', { method: 'POST', body: formData });
-      const data = await response.json();
-
-      if (data.error) {
-        statusText.innerHTML = '❌ Fehler';
-        statusDetail.textContent = data.error;
-        startBtn.disabled = false;
-        return;
-      }
-
-      statusText.innerHTML = '<span class="spinner"></span> Modell wird geladen & Transkription läuft...';
-      statusDetail.textContent = 'Das kann beim ersten Mal 1–2 Minuten dauern (Modell-Download).';
-      progBar.style.display = 'block';
-
-      const es = new EventSource(`/progress?job=${data.job_id}`);
-
-      es.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'progress') {
-          progFill.style.width = msg.value + '%';
-          if (msg.value > 0) statusDetail.textContent = `Fortschritt: ${msg.value}%`;
-        } else if (msg.type === 'done') {
-          es.close();
-          progFill.style.width = '100%';
-          statusText.innerHTML = '✅ Fertig';
-          statusDetail.textContent = `Sprache erkannt: ${msg.language} · Dauer: ${msg.duration}s · Gespeichert als: ${msg.saved_as}`;
-          transcript.value = msg.text;
-          result.classList.add('visible');
-          startBtn.disabled = false;
-        } else if (msg.type === 'error') {
-          es.close();
-          statusText.innerHTML = '❌ Fehler';
-          statusDetail.textContent = msg.message;
-          progBar.style.display = 'none';
-          startBtn.disabled = false;
-        }
-      };
-
-      es.onerror = () => {
-        es.close();
-        statusText.innerHTML = '❌ Verbindungsfehler';
-        statusDetail.textContent = 'Verbindung zum Server unterbrochen.';
-        progBar.style.display = 'none';
-        startBtn.disabled = false;
-      };
-
-    } catch (err) {
-      statusText.innerHTML = '❌ Verbindungsfehler';
-      statusDetail.textContent = err.message;
-      progBar.style.display = 'none';
-      startBtn.disabled = false;
-    }
-  });
-
-  copyBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(transcript.value);
-    copyBtn.textContent = 'Kopiert!';
-    setTimeout(() => copyBtn.textContent = 'Kopieren', 2000);
-  });
-</script>
-</body>
-</html>"""
-
-
-def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, output_folder, file_name):
-    _tqdm_local.job_id = job_id
-    try:
+def _get_model(model_name):
+    """Lädt das Modell beim ersten Gebrauch und hält es danach im Speicher. Nur mit _transcribe_lock aufrufen."""
+    if model_name in _models:
+        return _models[model_name]
+    _models.clear()  # nur ein Modell im Speicher halten
+
+    print(f"  → Lade Modell '{model_name}'...")
+    if HOSTED:
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    else:
         import torch
         if torch.cuda.is_available():
             device = "cuda"
@@ -631,7 +192,6 @@ def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, out
         else:
             device = "cpu"
 
-        print(f"  → Lade Modell '{model_name}'...")
         # Auf CPU laden und alignment_heads (sparse Tensor) in dense umwandeln,
         # da MPS keine sparse Tensoren unterstützt (siehe pytorch/pytorch#78168).
         model = whisper.load_model(model_name, device="cpu")
@@ -639,35 +199,84 @@ def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, out
             model.alignment_heads = model.alignment_heads.to_dense()
             model = model.to(device)
 
-        print(f"  → Transkribiere '{file_name}'...")
-        kwargs = {"verbose": False}
-        if language != "auto":
-            kwargs["language"] = language
+    _models[model_name] = model
+    return model
 
-        # fp16 nur auf CUDA aktivieren: Apples MPS-Backend liefert bei manchen
-        # Whisper-Modellen in fp16 NaN-Logits, daher dort auf fp32 bleiben.
-        result = model.transcribe(tmp_path, fp16=(device == "cuda"), **kwargs)
-        text = result["text"].strip()
-        lang = result.get("language", "?")
 
-        import subprocess
-        try:
-            r = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", tmp_path],
-                capture_output=True, text=True
-            )
-            duration = round(float(r.stdout.strip()))
-        except Exception:
-            duration = "?"
+def _preload_model(model_name):
+    """Lädt das Standardmodell vorab, damit der erste Upload nicht auf den Download wartet."""
+    try:
+        with _transcribe_lock:
+            _get_model(model_name)
+        print(f"  ✓ Modell '{model_name}' bereit")
+    except Exception as e:
+        print(f"  Modell '{model_name}' konnte nicht vorab geladen werden: {e}")
 
-        if output_folder and Path(output_folder).is_dir():
-            save_dir = Path(output_folder)
-        else:
-            save_dir = Path(__file__).parent / "transcriptions"
-            save_dir.mkdir(exist_ok=True)
 
-        import re
+def _transcribe_openai(job_id, model, path, language):
+    _tqdm_local.job_id = job_id
+    kwargs = {"verbose": False}
+    if language != "auto":
+        kwargs["language"] = language
+
+    # fp16 nur auf CUDA aktivieren: Apples MPS-Backend liefert bei manchen
+    # Whisper-Modellen in fp16 NaN-Logits, daher dort auf fp32 bleiben.
+    result = model.transcribe(path, fp16=(model.device.type == "cuda"), **kwargs)
+
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True
+        )
+        duration = round(float(r.stdout.strip()))
+    except Exception:
+        duration = "?"
+
+    return result["text"].strip(), result.get("language", "?"), duration
+
+
+def _decode_audio(path, sampling_rate=16000):
+    """Dekodiert die Datei mit ffmpeg zu 16-kHz-Mono, wie es Whisper erwartet.
+
+    faster-whisper könnte das selbst per PyAV, verträgt sich aber nicht mit jeder PyAV-Version.
+    """
+    import numpy as np
+    r = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path,
+         "-f", "s16le", "-ac", "1", "-ar", str(sampling_rate), "-"],
+        capture_output=True,
+    )
+    if r.returncode != 0 or not r.stdout:
+        detail = r.stderr.decode(errors="ignore").strip().splitlines()
+        raise RuntimeError("Audio konnte nicht gelesen werden" + (f": {detail[-1]}" if detail else "."))
+    return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768.0
+
+
+def _transcribe_faster(job_id, model, path, language):
+    # vad_filter überspringt Stille, in der Whisper sonst gern Text erfindet
+    segments, info = model.transcribe(
+        _decode_audio(path), language=None if language == "auto" else language, vad_filter=True,
+    )
+    parts = []
+    for segment in segments:  # Generator: transkribiert wird erst beim Durchlaufen
+        parts.append(segment.text)
+        if info.duration:
+            _set_progress(job_id, segment.end / info.duration * 100)
+    return "".join(parts).strip(), info.language, round(info.duration)
+
+
+def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, output_folder, file_name):
+    try:
+        with _transcribe_lock:
+            with _jobs_lock:
+                _jobs[job_id]["state"] = "running"
+            model = _get_model(model_name)
+            # Gehostet keine Dateinamen ins Log schreiben
+            print(f"  → Transkribiere {'Job ' + job_id[:8] if HOSTED else repr(file_name)}...")
+            transcribe = _transcribe_faster if HOSTED else _transcribe_openai
+            text, lang, duration = transcribe(job_id, model, tmp_path, language)
+
         ts_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+at\s+(\d{2}\.\d{2}\.\d{2})', file_name)
         timestamp = f"{ts_match.group(1)} - {ts_match.group(2)}" if ts_match else None
 
@@ -681,26 +290,52 @@ def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, out
             prefix = None
 
         formatted_text = f"{prefix}: {text}" if prefix else text
-        txt_name = Path(file_name).stem + ".txt"
-        txt_path = save_dir / txt_name
-        txt_path.write_text(formatted_text, encoding="utf-8")
-        print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
+
+        saved_as = None
+        if not HOSTED:
+            if output_folder and Path(output_folder).is_dir():
+                save_dir = Path(output_folder)
+            else:
+                save_dir = Path(__file__).parent / "transcriptions"
+                save_dir.mkdir(exist_ok=True)
+            txt_path = save_dir / (Path(file_name).stem + ".txt")
+            txt_path.write_text(formatted_text, encoding="utf-8")
+            saved_as = str(txt_path)
+            print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
+        else:
+            print(f"  ✓ Job {job_id[:8]} fertig")
 
         with _jobs_lock:
-            _jobs[job_id]["progress"] = 100
-            _jobs[job_id]["done"] = True
-            _jobs[job_id]["result"] = {
-                "text": formatted_text,
-                "language": lang,
-                "duration": duration,
-                "saved_as": str(txt_path),
-            }
+            _jobs[job_id].update({
+                "progress": 100,
+                "done": True,
+                "finished_at": time.time(),
+                "result": {
+                    "text": formatted_text,
+                    "language": lang,
+                    "duration": duration,
+                    "saved_as": saved_as,
+                },
+            })
     except Exception as e:
         with _jobs_lock:
-            _jobs[job_id]["done"] = True
-            _jobs[job_id]["error"] = str(e)
+            _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": str(e)})
     finally:
         os.unlink(tmp_path)
+
+
+def _prune_jobs():
+    """Entfernt fertige Jobs, deren Ergebnis nicht innerhalb von JOB_TTL abgeholt wurde."""
+    now = time.time()
+    with _jobs_lock:
+        for job_id in [k for k, j in _jobs.items() if j["done"] and now - j["finished_at"] > JOB_TTL]:
+            del _jobs[job_id]
+
+
+def _prune_jobs_forever():
+    while True:
+        time.sleep(300)
+        _prune_jobs()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -709,6 +344,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _is_local_request(self):
         """Lässt nur Anfragen der eigenen Seite zu, nicht die fremder Webseiten im selben Browser."""
+        if HOSTED:
+            return True  # gehostet schützt das Token den Upload
         port = self.server.server_address[1]
         names = ("127.0.0.1", "localhost")
         hosts = {f"{name}:{port}" for name in names}
@@ -719,6 +356,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return origin is None or origin in {f"http://{host}" for host in hosts}
 
+    def _is_authorized(self):
+        if not HOSTED:
+            return True
+        auth = self.headers.get("Authorization", "")
+        return hmac.compare_digest(auth.encode(), f"Bearer {TOKEN}".encode())
+
     def do_GET(self):
         if not self._is_local_request():
             self.send_error(403)
@@ -726,46 +369,100 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         if parsed.path == "/progress":
-            job_id = parse_qs(parsed.query).get("job", [None])[0]
-            if not job_id:
-                self.send_response(400)
-                self.end_headers()
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            try:
-                while True:
-                    with _jobs_lock:
-                        job = _jobs.get(job_id, {}).copy()
-                    if not job:
-                        break
-                    if job.get("done"):
-                        if job.get("error"):
-                            payload = json.dumps({"type": "error", "message": job["error"]})
-                        else:
-                            payload = json.dumps({"type": "done", **job["result"]})
-                        self.wfile.write(f"data: {payload}\n\n".encode())
-                        self.wfile.flush()
-                        with _jobs_lock:
-                            _jobs.pop(job_id, None)
-                        break
-                    else:
-                        payload = json.dumps({"type": "progress", "value": job.get("progress", 0)})
-                        self.wfile.write(f"data: {payload}\n\n".encode())
-                        self.wfile.flush()
-                    time.sleep(0.5)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            self.close_connection = True  # Stream ist zu Ende, nicht auf weitere Anfragen warten
+            self._stream_progress(parse_qs(parsed.query).get("job", [None])[0])
             return
 
+        if parsed.path == "/config":
+            self._json_response({
+                "hosted": HOSTED,
+                "models": MODELS,
+                "default_model": DEFAULT_MODEL,
+                "languages": LANGUAGES,
+            })
+            return
+
+        if parsed.path in STATIC_FILES:
+            name, content_type, cache = STATIC_FILES[parsed.path]
+            try:
+                body = (STATIC_DIR / name).read_bytes()
+            except FileNotFoundError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if name == "index.html":
+                self.send_header("Content-Security-Policy", CSP)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_error(404)
+
+    def _stream_progress(self, job_id):
+        """Schickt Fortschritt und Ergebnis eines Jobs als Server-Sent Events."""
+        if not job_id:
+            self.send_response(400)
+            self.end_headers()
+            return
         self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")  # Reverse-Proxys sollen den Stream nicht puffern
         self.end_headers()
-        self.wfile.write(HTML.encode("utf-8"))
+        try:
+            while True:
+                with _jobs_lock:
+                    job = _jobs.get(job_id, {}).copy()
+                if not job:
+                    payload = {
+                        "type": "error",
+                        "gone": True,
+                        "message": "Job nicht gefunden – abgelaufen oder Server neu gestartet.",
+                    }
+                elif job.get("done"):
+                    if job.get("error"):
+                        payload = {"type": "error", "message": job["error"]}
+                    else:
+                        # Der Job bleibt bestehen, bis die Seite das Ergebnis per DELETE /job
+                        # bestätigt; so geht es nicht verloren, wenn die Verbindung abreißt.
+                        payload = {"type": "done", "file_name": job["file_name"], **job["result"]}
+                else:
+                    payload = {
+                        "type": "progress",
+                        "state": job["state"],
+                        "value": job.get("progress", 0),
+                        "file_name": job["file_name"],
+                    }
+                self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+                if payload["type"] != "progress":
+                    break
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True  # Stream ist zu Ende, nicht auf weitere Anfragen warten
+
+    def do_DELETE(self):
+        """Die Seite hat das Ergebnis gespeichert, der Server vergisst es."""
+        if not self._is_local_request():
+            self.send_error(403)
+            return
+        parsed = urlparse(self.path)
+        if parsed.path != "/job":
+            self.send_error(404)
+            return
+        job_id = parse_qs(parsed.query).get("job", [None])[0]
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job and job["done"]:
+                del _jobs[job_id]
+        self.send_response(204)
+        self.end_headers()
 
     def do_POST(self):
         if not self._is_local_request():
@@ -777,17 +474,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if not self._is_authorized():
+            self._json_response({"error": "Ungültiges oder fehlendes Token."}, status=401)
+            return
+
         content_type = self.headers.get("Content-Type", "")
         length = int(self.headers.get("Content-Length", 0))
+        if HOSTED and length > MAX_UPLOAD_BYTES:
+            self._json_response(
+                {"error": f"Datei zu groß (max. {MAX_UPLOAD_BYTES // 1024 // 1024} MB)."}, status=413,
+            )
+            return
         body = self.rfile.read(length)
 
         # Parse multipart
-        boundary = content_type.split("boundary=")[-1].encode()
+        boundary = content_type.split("boundary=")[-1].strip('"').encode()
         parts = body.split(b"--" + boundary)
 
         file_data = None
         file_name = "audio.ogg"
-        model_name = "base"
+        model_name = DEFAULT_MODEL
         language = "de"
         speaker_name = ""
         output_folder = ""
@@ -825,7 +531,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_response({"error": f"Unbekannte Sprache: {language}"})
             return
 
-        if output_folder:
+        if HOSTED:
+            output_folder = ""  # gehostet wird nichts gespeichert
+        elif output_folder:
             output_dir = Path(output_folder).expanduser()
             if not output_dir.is_dir():
                 self._json_response({"error": f"Ausgabeordner nicht gefunden: {output_folder}"})
@@ -837,9 +545,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tmp.write(file_data)
             tmp_path = tmp.name
 
+        _prune_jobs()
         job_id = str(uuid.uuid4())
         with _jobs_lock:
-            _jobs[job_id] = {"progress": 0, "done": False, "result": None, "error": None}
+            _jobs[job_id] = {
+                "state": "queued",
+                "progress": 0,
+                "done": False,
+                "finished_at": None,
+                "file_name": file_name,
+                "result": None,
+                "error": None,
+            }
 
         threading.Thread(
             target=_run_transcription,
@@ -849,9 +566,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._json_response({"job_id": job_id})
 
-    def _json_response(self, data):
+    def _json_response(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(body))
         self.end_headers()
@@ -971,14 +688,29 @@ def create_server(port):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lokales Whisper Transkriptions-Tool")
+    parser = argparse.ArgumentParser(description="Whisper Transkriptions-Tool")
     parser.add_argument(
         "-p", "--port", type=parse_port, default=DEFAULT_PORT,
         help=f"Port für die Weboberfläche (Standard: {DEFAULT_PORT})",
     )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="Browser beim Start nicht öffnen",
+    )
     args = parser.parse_args()
 
-    if not find_and_add_ffmpeg():
+    if DEFAULT_MODEL not in MODELS:
+        print(f"  Unbekanntes Standardmodell '{DEFAULT_MODEL}'. Erlaubt: {', '.join(MODELS)}")
+        sys.exit(1)
+
+    if HOSTED:
+        if not TOKEN:
+            print("  TRANSCRIBE_TOKEN ist nicht gesetzt. Ohne Token könnte jeder den Server benutzen.")
+            sys.exit(1)
+        if not shutil.which("ffmpeg"):
+            print("  ffmpeg wurde nicht gefunden (z.B. apt install ffmpeg).")
+            sys.exit(1)
+    elif not find_and_add_ffmpeg():
         print("  Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.")
         print("  Installation: brew install ffmpeg (macOS), winget install Gyan.FFmpeg (Windows),")
         print("                sudo apt install ffmpeg (Linux)")
@@ -987,17 +719,23 @@ def main():
 
     httpd = create_server(args.port)
     url = f"http://{HOST}:{httpd.server_address[1]}"
+    open_browser = not (HOSTED or args.no_browser)
 
     print("=" * 50)
-    print("  Whisper Transkriptions-Tool")
+    print("  Whisper Transkriptions-Tool" + (" (gehostet)" if HOSTED else ""))
     print("=" * 50)
     print(f"  Server läuft auf {url}")
-    print("  Browser öffnet sich automatisch...")
+    if open_browser:
+        print("  Browser öffnet sich automatisch...")
     stop_key = "Strg+C" if sys.platform == "win32" else "Ctrl+C"
     print(f"  Zum Beenden: {stop_key}")
     print("=" * 50)
 
-    threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+    threading.Thread(target=_prune_jobs_forever, daemon=True).start()
+    if HOSTED:
+        threading.Thread(target=_preload_model, args=(DEFAULT_MODEL,), daemon=True).start()
+    if open_browser:
+        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
     with httpd:
         try:
