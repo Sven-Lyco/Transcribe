@@ -1,0 +1,20 @@
+# Hält die gepinnten Versionen im Dockerfile und in requirements-server.txt aktuell:
+# Dependabot öffnet einmal pro Woche einen Pull Request mit den Updates.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # Bei Python 3.12 bleiben, nur Sicherheits- und Patch-Updates des Images übernehmen
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      server-dependencies:
+        patterns: ["*"]

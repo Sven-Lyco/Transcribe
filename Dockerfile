@@ -1,6 +1,7 @@
 # Gehostete Variante für Coolify & Co.: faster-whisper auf der CPU, keine Dateien auf dem Server.
 # Audio wird über PyAV dekodiert, das ffmpeg-Paket des Systems wird nicht gebraucht.
-FROM python:3.12-slim
+# Per Digest gepinnt; Dependabot (.github/dependabot.yml) schlägt Updates als Pull Request vor
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

@@ -22,6 +22,7 @@ import argparse
 import errno
 import hmac
 import http.server
+import io
 import socketserver
 import json
 import os
@@ -40,7 +41,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 HOSTED = os.environ.get("TRANSCRIBE_HOSTED") == "1"
-TOKEN = os.environ.get("TRANSCRIBE_TOKEN", "")
+TOKEN = os.environ.get("TRANSCRIBE_TOKEN", "").strip()
+MIN_TOKEN_LENGTH = 32
 
 HOST = "0.0.0.0" if HOSTED else "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -58,13 +60,19 @@ MODELS = ("small", "medium", "large-v3-turbo") if HOSTED else ("tiny", "base", "
 DEFAULT_MODEL = os.environ.get("TRANSCRIBE_MODEL", "large-v3-turbo" if HOSTED else "medium")
 LANGUAGES = ("de", "en", "auto")
 
-JOB_TTL = 3600  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Speicher bleibt
+JOB_TTL = 15 * 60  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Speicher bleibt
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # nur gehostet
+MAX_ACTIVE_JOBS = 5  # gehostet: wartende + laufende Transkriptionen
+MAX_CONNECTIONS = 64  # gleichzeitige Verbindungen, darüber wird sofort geschlossen
+SOCKET_TIMEOUT = 60  # Sekunden ohne Datenfluss, bevor eine Verbindung aufgegeben wird
+MAX_FILE_NAME = 200
 
 STATIC_DIR = Path(__file__).parent / "static"
 # Ausgelieferte Dateien: Pfad -> (Datei, Content-Type, Cache-Control)
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8", "no-cache"),
+    "/app.css": ("app.css", "text/css; charset=utf-8", "no-cache"),
     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json", "no-cache"),
     "/sw.js": ("sw.js", "text/javascript; charset=utf-8", "no-cache"),
     "/icon.svg": ("icon.svg", "image/svg+xml", "max-age=86400"),
@@ -72,12 +80,16 @@ STATIC_FILES = {
     "/icon-512.png": ("icon-512.png", "image/png", "max-age=86400"),
     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png", "max-age=86400"),
 }
-# Die Seite lädt nichts von fremden Servern
+# Die Seite lädt nichts von fremden Servern und führt keine eingebetteten Scripts aus
 CSP = (
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; "
+    "default-src 'self'; img-src 'self' data:; object-src 'none'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
+PERMISSIONS_POLICY = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+
+
+class TranscriptionError(Exception):
+    """Fehler, dessen Meldung der Nutzer sehen darf."""
 
 # ffmpeg automatisch finden (PATH, Windows WinGet + macOS Homebrew)
 def find_and_add_ffmpeg():
@@ -236,8 +248,8 @@ def _transcribe_openai(job_id, model, path, language):
     return result["text"].strip(), result.get("language", "?"), duration
 
 
-def _decode_audio(path, sampling_rate=16000):
-    """Dekodiert die Datei per PyAV zu 16-kHz-Mono, wie es Whisper erwartet.
+def _decode_audio(data, sampling_rate=16000):
+    """Dekodiert die Audiodaten im Speicher per PyAV zu 16-kHz-Mono, wie es Whisper erwartet.
 
     Ersetzt faster_whisper.decode_audio: Das übergibt in 1.2.1 `metadata_errors`,
     das PyAV ab Version 15 nicht mehr kennt.
@@ -248,24 +260,23 @@ def _decode_audio(path, sampling_rate=16000):
     resampler = av.AudioResampler(format="s16", layout="mono", rate=sampling_rate)
     chunks = []
     try:
-        with av.open(path) as container:
+        with av.open(io.BytesIO(data)) as container:
             if not container.streams.audio:
-                raise RuntimeError(no_audio)
+                raise TranscriptionError(no_audio)
             for frame in container.decode(audio=0):
                 chunks.extend(f.to_ndarray().reshape(-1) for f in resampler.resample(frame))
         chunks.extend(f.to_ndarray().reshape(-1) for f in resampler.resample(None))  # Rest leeren
     except (av.FFmpegError, ValueError) as e:
-        # Die Meldung von PyAV enthält den Pfad der Temp-Datei, daher nicht durchreichen
-        raise RuntimeError("Audio konnte nicht gelesen werden (beschädigt oder unbekanntes Format).") from e
+        raise TranscriptionError("Audio konnte nicht gelesen werden (beschädigt oder unbekanntes Format).") from e
     if not chunks:
-        raise RuntimeError(no_audio)
+        raise TranscriptionError(no_audio)
     return np.concatenate(chunks).astype(np.float32) / 32768.0
 
 
-def _transcribe_faster(job_id, model, path, language):
+def _transcribe_faster(job_id, model, data, language):
     # vad_filter überspringt Stille, in der Whisper sonst gern Text erfindet
     segments, info = model.transcribe(
-        _decode_audio(path), language=None if language == "auto" else language, vad_filter=True,
+        _decode_audio(data), language=None if language == "auto" else language, vad_filter=True,
     )
     parts = []
     for segment in segments:  # Generator: transkribiert wird erst beim Durchlaufen
@@ -275,7 +286,8 @@ def _transcribe_faster(job_id, model, path, language):
     return "".join(parts).strip(), info.language, round(info.duration)
 
 
-def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, output_folder, file_name):
+def _run_transcription(job_id, model_name, audio, language, speaker_name, output_folder, file_name):
+    """`audio` ist gehostet der Dateiinhalt (bleibt im Speicher), lokal der Pfad einer Temp-Datei."""
     try:
         with _transcribe_lock:
             with _jobs_lock:
@@ -284,7 +296,7 @@ def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, out
             # Gehostet keine Dateinamen ins Log schreiben
             print(f"  → Transkribiere {'Job ' + job_id[:8] if HOSTED else repr(file_name)}...")
             transcribe = _transcribe_faster if HOSTED else _transcribe_openai
-            text, lang, duration = transcribe(job_id, model, tmp_path, language)
+            text, lang, duration = transcribe(job_id, model, audio, language)
 
         ts_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+at\s+(\d{2}\.\d{2}\.\d{2})', file_name)
         timestamp = f"{ts_match.group(1)} - {ts_match.group(2)}" if ts_match else None
@@ -327,10 +339,17 @@ def _run_transcription(job_id, model_name, tmp_path, language, speaker_name, out
                 },
             })
     except Exception as e:
+        if isinstance(e, TranscriptionError) or not HOSTED:
+            message = str(e)
+        else:
+            # Interne Details (Pfade, Bibliotheksfehler) nur ins Server-Log
+            print(f"  ✗ Job {job_id[:8]} fehlgeschlagen: {e!r}")
+            message = "Transkription fehlgeschlagen. Details stehen im Server-Log."
         with _jobs_lock:
-            _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": str(e)})
+            _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
     finally:
-        os.unlink(tmp_path)
+        if not HOSTED:
+            os.unlink(audio)
 
 
 def _prune_jobs():
@@ -343,13 +362,26 @@ def _prune_jobs():
 
 def _prune_jobs_forever():
     while True:
-        time.sleep(300)
+        time.sleep(60)
         _prune_jobs()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    timeout = SOCKET_TIMEOUT  # hängende oder absichtlich langsame Verbindungen nicht ewig offen halten
+
     def log_message(self, format, *args):
         pass  # Stille Logs
+
+    def version_string(self):
+        return "Transcribe"  # statt Python-Version im Server-Header
+
+    def end_headers(self):
+        # Gilt für alle Antworten, auch für Fehlerseiten von send_error
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if HOSTED:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        super().end_headers()
 
     def _is_local_request(self):
         """Lässt nur Anfragen der eigenen Seite zu, nicht die fremder Webseiten im selben Browser."""
@@ -401,10 +433,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", len(body))
             self.send_header("Cache-Control", cache)
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
             if name == "index.html":
                 self.send_header("Content-Security-Policy", CSP)
+                self.send_header("Permissions-Policy", PERMISSIONS_POLICY)
             self.end_headers()
             self.wfile.write(body)
             return
@@ -419,7 +450,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-store")  # Transkripte nirgends zwischenspeichern
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")  # Reverse-Proxys sollen den Stream nicht puffern
         self.end_headers()
@@ -488,16 +519,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         content_type = self.headers.get("Content-Type", "")
-        length = int(self.headers.get("Content-Length", 0))
+        if "boundary=" not in content_type:
+            self._json_response({"error": "Erwartet multipart/form-data."}, status=400)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._json_response({"error": "Content-Length fehlt."}, status=411)
+            return
         if HOSTED and length > MAX_UPLOAD_BYTES:
             self._json_response(
                 {"error": f"Datei zu groß (max. {MAX_UPLOAD_BYTES // 1024 // 1024} MB)."}, status=413,
             )
             return
+
+        if HOSTED:
+            with _jobs_lock:
+                active = sum(1 for j in _jobs.values() if not j["done"])
+            if active >= MAX_ACTIVE_JOBS:
+                self._json_response(
+                    {"error": "Server ausgelastet. Bitte in ein paar Minuten noch einmal versuchen."},
+                    status=503,
+                )
+                return
+
         body = self.rfile.read(length)
 
         # Parse multipart
-        boundary = content_type.split("boundary=")[-1].strip('"').encode()
+        boundary = content_type.split("boundary=")[-1].split(";")[0].strip().strip('"').encode()
         parts = body.split(b"--" + boundary)
 
         file_data = None
@@ -518,26 +569,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if 'name="file"' in header_str:
                 file_data = content
                 if 'filename="' in header_str:
-                    file_name = header_str.split('filename="')[1].split('"')[0]
+                    name = header_str.split('filename="')[1].split('"')[0]
+                    file_name = Path(name).name[:MAX_FILE_NAME] or file_name
             elif 'name="model"' in header_str:
-                model_name = content.decode().strip()
+                model_name = content.decode(errors="replace").strip()
             elif 'name="language"' in header_str:
-                language = content.decode().strip()
+                language = content.decode(errors="replace").strip()
             elif 'name="speaker_name"' in header_str:
-                speaker_name = content.decode().strip()
+                speaker_name = content.decode(errors="replace").strip()[:MAX_FILE_NAME]
             elif 'name="output_folder"' in header_str:
-                output_folder = content.decode().strip()
+                output_folder = content.decode(errors="replace").strip()
 
         if not file_data:
-            self._json_response({"error": "Keine Datei empfangen."})
+            self._json_response({"error": "Keine Datei empfangen."}, status=400)
             return
 
         if model_name not in MODELS:
-            self._json_response({"error": f"Unbekanntes Modell: {model_name}"})
+            self._json_response({"error": f"Unbekanntes Modell. Erlaubt: {', '.join(MODELS)}"}, status=400)
             return
 
         if language not in LANGUAGES:
-            self._json_response({"error": f"Unbekannte Sprache: {language}"})
+            self._json_response({"error": f"Unbekannte Sprache. Erlaubt: {', '.join(LANGUAGES)}"}, status=400)
             return
 
         if HOSTED:
@@ -549,10 +601,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             output_folder = str(output_dir)
 
-        suffix = Path(file_name).suffix or ".ogg"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(file_data)
-            tmp_path = tmp.name
+        if HOSTED:
+            audio = file_data  # bleibt im Speicher, landet nie auf der Platte
+        else:
+            # openai-whisper braucht einen Dateipfad für ffmpeg
+            suffix = Path(file_name).suffix or ".ogg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(file_data)
+                audio = tmp.name
 
         _prune_jobs()
         job_id = str(uuid.uuid4())
@@ -569,7 +625,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         threading.Thread(
             target=_run_transcription,
-            args=(job_id, model_name, tmp_path, language, speaker_name, output_folder, file_name),
+            args=(job_id, model_name, audio, language, speaker_name, output_folder, file_name),
             daemon=True,
         ).start()
 
@@ -580,12 +636,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(body))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
 
 class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True  # Ctrl+C soll nicht auf offene Fortschritts-Streams warten
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        # Bei zu vielen gleichzeitigen Verbindungen sofort schließen statt unbegrenzt Threads zu starten
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def parse_port(value):
@@ -713,8 +787,9 @@ def main():
         sys.exit(1)
 
     if HOSTED:
-        if not TOKEN:
-            print("  TRANSCRIBE_TOKEN ist nicht gesetzt. Ohne Token könnte jeder den Server benutzen.")
+        if len(TOKEN) < MIN_TOKEN_LENGTH:
+            print(f"  TRANSCRIBE_TOKEN fehlt oder ist kürzer als {MIN_TOKEN_LENGTH} Zeichen.")
+            print("  Ein sicheres Token erzeugen mit: openssl rand -hex 32")
             sys.exit(1)
     elif not find_and_add_ffmpeg():
         print("  Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.")

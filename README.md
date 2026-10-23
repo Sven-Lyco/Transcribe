@@ -30,10 +30,11 @@ Local mode:
 
 Hosted mode:
 
-- Audio is uploaded to your own server, transcribed there, and deleted right away.
-- The server never writes transcriptions to disk. A result stays in memory only until the web app has fetched it, and for at most one hour if it is never fetched.
+- Audio is uploaded to your own server and transcribed there. It is kept in memory only and never written to disk.
+- The server never writes transcriptions to disk. A result stays in memory only until the web app has fetched it, and for at most 15 minutes if it is never fetched.
 - Transcriptions are stored only in the `localStorage` of the browser that fetched them.
-- Uploads require a secret token.
+- Uploads require a secret token of at least 32 characters.
+- The server logs neither file names nor content.
 
 ## Requirements
 
@@ -144,7 +145,7 @@ The same app can run on a server as a web app for your phone. In hosted mode it 
 
 1. Create a new resource from this Git repository and choose the **Dockerfile** build pack.
 2. Set the port to `8765` and assign a domain with HTTPS. The web app needs HTTPS.
-3. Add the environment variable `TRANSCRIBE_TOKEN` with a long random value, for example from `openssl rand -hex 32`.
+3. Add the environment variable `TRANSCRIBE_TOKEN` with a random value of at least 32 characters, for example from `openssl rand -hex 32`. Do not mark it as a build variable.
 4. Add a persistent volume mounted at `/models`. Otherwise every deployment downloads the model again.
 5. Deploy. On first start the server downloads the default model (about 1.6 GB) and logs `Modell 'large-v3-turbo' bereit`.
 
@@ -152,7 +153,7 @@ Optional environment variables:
 
 | Variable           | Default          | Meaning                                                       |
 |--------------------|------------------|---------------------------------------------------------------|
-| `TRANSCRIBE_TOKEN` | –                | Required. Secret for uploads.                                 |
+| `TRANSCRIBE_TOKEN` | –                | Required. Secret for uploads, at least 32 characters.         |
 | `TRANSCRIBE_MODEL` | `large-v3-turbo` | Default model: `small`, `medium`, or `large-v3-turbo`.        |
 
 The server needs at least 4 GB of RAM for `large-v3-turbo`. On a CPU with 4 cores, a voice message takes roughly as long to transcribe as it is to listen to. If that is too slow, set `TRANSCRIBE_MODEL=medium` or `small`.
@@ -161,10 +162,25 @@ Without Coolify:
 
 ```bash
 docker build -t transcribe .
-docker run -d -p 8765:8765 -e TRANSCRIBE_TOKEN=<secret> -v transcribe-models:/models transcribe
+docker run -d -p 127.0.0.1:8765:8765 -e TRANSCRIBE_TOKEN=<secret> -v transcribe-models:/models transcribe
 ```
 
-Put a reverse proxy with HTTPS in front of it.
+Put a reverse proxy with HTTPS in front of it. Binding to `127.0.0.1` keeps the plain HTTP port off the internet.
+
+### Security checklist
+
+- **Expose the app only through the HTTPS proxy.** In Coolify set only *Ports Exposes* to `8765` and leave *Ports Mappings* empty. A mapping such as `8765:8765` makes the server reachable over plain HTTP from the internet, token included, and Docker bypasses host firewalls such as UFW.
+- **Keep the token secret.** Do not share the Shortcut, since the token is part of it. If the token leaks, set a new `TRANSCRIBE_TOKEN`, redeploy, and update the web app settings and the Shortcut.
+- **Restrict the container** (optional). The app runs as a non-root user and also works with a read-only file system and without Linux capabilities. In Coolify, add these under *Custom Docker Options* if your version supports them:
+
+  ```text
+  --read-only --tmpfs /tmp --cap-drop=ALL --security-opt=no-new-privileges
+  ```
+
+- **Keep dependencies current.** All versions in `Dockerfile` and `requirements-server.txt` are pinned. Dependabot opens a pull request each week when updates are available; merging it triggers a new deployment.
+- **Exported history files** contain all transcriptions in plain text. Store them accordingly.
+
+Built-in protections: constant-time token check, upload limit of 100 MB, at most 5 queued transcriptions, at most 64 simultaneous connections with a 60-second idle timeout, strict Content Security Policy without inline scripts, HSTS, and `Cache-Control: no-store` on all responses that contain transcriptions.
 
 ### Using the web app on iPhone
 
@@ -219,7 +235,13 @@ The model is being downloaded. Later runs use the cached copy.
 The token in the web app settings or in the Shortcut does not match `TRANSCRIBE_TOKEN` on the server.
 
 **`Job nicht gefunden` (hosted mode)**
-The result was not fetched within one hour, or the server was restarted in the meantime. Share the voice message again.
+The result was not fetched within 15 minutes, or the server was restarted in the meantime. Share the voice message again.
+
+**`Server ausgelastet` (hosted mode)**
+Five transcriptions are already queued or running. Wait a few minutes and try again.
+
+**`TRANSCRIBE_TOKEN fehlt oder ist kürzer als 32 Zeichen` at startup (hosted mode)**
+Generate a longer token, for example with `openssl rand -hex 32`, and set it as `TRANSCRIBE_TOKEN`.
 
 **The history is gone (iPhone)**
 Safari deletes website data after 7 days of Safari use without visiting the site. Export the history from time to time (⚙︎ → `Verlauf exportieren`). A Home Screen web app keeps a separate history from the Safari tab; see [Using the web app on iPhone](#using-the-web-app-on-iphone).
