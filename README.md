@@ -198,11 +198,11 @@ To transcribe a voice message, long-press it in WhatsApp, tap **Forward** (*Weit
 ### Running hosted mode without Docker
 
 ```bash
-pip install faster-whisper
+pip install -r requirements-server.txt
 TRANSCRIBE_HOSTED=1 TRANSCRIBE_TOKEN=<secret> python transcribe.py
 ```
 
-ffmpeg must be installed. The server listens on all interfaces.
+The server listens on all interfaces. ffmpeg is not needed in hosted mode; audio is decoded with PyAV.
 
 ## Troubleshooting
 

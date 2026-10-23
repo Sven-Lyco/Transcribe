@@ -237,20 +237,29 @@ def _transcribe_openai(job_id, model, path, language):
 
 
 def _decode_audio(path, sampling_rate=16000):
-    """Dekodiert die Datei mit ffmpeg zu 16-kHz-Mono, wie es Whisper erwartet.
+    """Dekodiert die Datei per PyAV zu 16-kHz-Mono, wie es Whisper erwartet.
 
-    faster-whisper könnte das selbst per PyAV, verträgt sich aber nicht mit jeder PyAV-Version.
+    Ersetzt faster_whisper.decode_audio: Das übergibt in 1.2.1 `metadata_errors`,
+    das PyAV ab Version 15 nicht mehr kennt.
     """
+    import av
     import numpy as np
-    r = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", path,
-         "-f", "s16le", "-ac", "1", "-ar", str(sampling_rate), "-"],
-        capture_output=True,
-    )
-    if r.returncode != 0 or not r.stdout:
-        detail = r.stderr.decode(errors="ignore").strip().splitlines()
-        raise RuntimeError("Audio konnte nicht gelesen werden" + (f": {detail[-1]}" if detail else "."))
-    return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768.0
+    no_audio = "Die Datei enthält keine Tonspur."
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=sampling_rate)
+    chunks = []
+    try:
+        with av.open(path) as container:
+            if not container.streams.audio:
+                raise RuntimeError(no_audio)
+            for frame in container.decode(audio=0):
+                chunks.extend(f.to_ndarray().reshape(-1) for f in resampler.resample(frame))
+        chunks.extend(f.to_ndarray().reshape(-1) for f in resampler.resample(None))  # Rest leeren
+    except (av.FFmpegError, ValueError) as e:
+        # Die Meldung von PyAV enthält den Pfad der Temp-Datei, daher nicht durchreichen
+        raise RuntimeError("Audio konnte nicht gelesen werden (beschädigt oder unbekanntes Format).") from e
+    if not chunks:
+        raise RuntimeError(no_audio)
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
 
 
 def _transcribe_faster(job_id, model, path, language):
@@ -706,9 +715,6 @@ def main():
     if HOSTED:
         if not TOKEN:
             print("  TRANSCRIBE_TOKEN ist nicht gesetzt. Ohne Token könnte jeder den Server benutzen.")
-            sys.exit(1)
-        if not shutil.which("ffmpeg"):
-            print("  ffmpeg wurde nicht gefunden (z.B. apt install ffmpeg).")
             sys.exit(1)
     elif not find_and_add_ffmpeg():
         print("  Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.")

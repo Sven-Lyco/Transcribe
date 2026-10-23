@@ -1,4 +1,5 @@
 # Gehostete Variante für Coolify & Co.: faster-whisper auf der CPU, keine Dateien auf dem Server.
+# Audio wird über PyAV dekodiert, das ffmpeg-Paket des Systems wird nicht gebraucht.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -7,11 +8,6 @@ ENV PYTHONUNBUFFERED=1 \
     TRANSCRIBE_HOSTED=1 \
     HF_HOME=/models \
     HF_HUB_DISABLE_TELEMETRY=1
-
-# ffmpeg dekodiert die Audiodateien (Opus, M4A, …)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements-server.txt .
