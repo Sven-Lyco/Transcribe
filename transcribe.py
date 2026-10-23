@@ -88,6 +88,14 @@ APP_DATA_DIR = Path(os.environ["TRANSCRIBE_DATA_DIR"]) if os.environ.get("TRANSC
 DEFAULT_OUTPUT_DIR = APP_DATA_DIR / "Transkripte" if APP_DATA_DIR else Path(__file__).parent / "transcriptions"
 # Merkt sich zu jedem Transkript Datum, Dauer und Originaldatei für den Verlauf
 HISTORY_INDEX = DEFAULT_OUTPUT_DIR / ".verlauf.json"
+# Original-Audiodateien für den Player im Verlauf
+AUDIO_DIR = DEFAULT_OUTPUT_DIR / ".audio"
+AUDIO_TYPES = {
+    ".opus": "audio/ogg; codecs=opus", ".ogg": "audio/ogg", ".oga": "audio/ogg", ".webm": "audio/webm",
+    ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".aac": "audio/aac", ".mp3": "audio/mpeg",
+    ".wav": "audio/wav", ".flac": "audio/flac", ".aiff": "audio/aiff", ".aif": "audio/aiff", ".caf": "audio/x-caf",
+}
+COMPAT_SUFFIX = ".compat.m4a"  # M4A-Fassung für Fenster, die das Originalformat nicht abspielen
 # Ausgelieferte Dateien: Pfad -> (Datei, Content-Type)
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -322,7 +330,14 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
             save_dir.mkdir(parents=True, exist_ok=True)
         txt_path = save_dir / (Path(file_name).stem + ".txt")
         txt_path.write_text(formatted_text, encoding="utf-8")
-        transcript_id = _add_to_history(txt_path, file_name, lang, duration)
+        transcript_id = uuid.uuid4().hex
+        # Abschnitte mit Zeiten, damit der Player den gerade gesprochenen Text hervorheben kann
+        segments = [
+            [round(seg["start"], 2), round(seg["end"], 2), seg["text"].strip()]
+            for seg in result.get("segments", []) if seg.get("text", "").strip()
+        ]
+        audio = _keep_original_audio(tmp_path, transcript_id)
+        _add_to_history(transcript_id, txt_path, file_name, lang, duration, segments, audio)
         print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
 
         with _jobs_lock:
@@ -368,21 +383,89 @@ def _save_history_index(index):
     tmp.replace(HISTORY_INDEX)
 
 
-def _add_to_history(txt_path, file_name, language, duration):
-    """Trägt ein gespeichertes Transkript in den Verlauf ein und gibt seine ID zurück."""
-    transcript_id = uuid.uuid4().hex
+def _keep_original_audio(src, transcript_id):
+    """Bewahrt die Original-Audiodatei für den Player im Verlauf auf und gibt ihren Dateinamen zurück."""
+    suffix = Path(src).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", suffix):
+        suffix = ""
+    name = f"{transcript_id}{suffix}"
+    try:
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, AUDIO_DIR / name)
+    except OSError as e:
+        print(f"  Audio konnte nicht aufbewahrt werden: {e}")  # dann eben ohne Player
+        return None
+    return name
+
+
+_compat_lock = threading.Lock()
+
+
+def _compat_audio(path):
+    """M4A/AAC-Fassung des Originals für Fenster, die dessen Format nicht abspielen können.
+
+    Auf aktuellen macOS-Versionen spielt WebKit auch Ogg/Opus aus WhatsApp; ältere tun das
+    womöglich nicht. Die Umwandlung passiert nur dann, einmalig, und wird neben dem Original abgelegt.
+    """
+    target = path.with_name(path.stem + COMPAT_SUFFIX)
+    with _compat_lock:  # WebKit fragt Ausschnitte parallel an
+        if not target.is_file():
+            tmp = target.with_name(target.name + ".part")
+            r = subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path), "-vn", "-ac", "1",
+                 "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", "-f", "ipod", str(tmp)],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                print(f"  Umwandeln zum Abspielen fehlgeschlagen: {r.stderr.strip()[-300:]}")
+                tmp.unlink(missing_ok=True)
+                return None
+            tmp.replace(target)
+    return target
+
+
+def _audio_file(meta):
+    """Pfad der aufbewahrten Audiodatei eines Index-Eintrags, oder None."""
+    name = meta.get("audio")
+    if not name or Path(name).name != name:
+        return None
+    return AUDIO_DIR / name
+
+
+def _remove_audio(meta):
+    path = _audio_file(meta)
+    if path:
+        path.unlink(missing_ok=True)
+        path.with_name(path.stem + COMPAT_SUFFIX).unlink(missing_ok=True)
+
+
+def _add_to_history(transcript_id, txt_path, file_name, language, duration, segments, audio):
+    """Trägt ein gespeichertes Transkript samt Abschnitten und Audiodatei in den Verlauf ein."""
     with _history_lock:
-        # Gleicher Dateiname überschreibt die .txt, dann auch den alten Eintrag ersetzen
-        index = {k: v for k, v in _load_history_index().items() if v.get("path") != str(txt_path)}
+        index = {}
+        for key, meta in _load_history_index().items():
+            if meta.get("path") == str(txt_path):
+                _remove_audio(meta)  # gleicher Dateiname überschreibt die .txt, der alte Eintrag fällt weg
+            else:
+                index[key] = meta
         index[transcript_id] = {
             "path": str(txt_path),
             "date": datetime.now().astimezone().isoformat(timespec="seconds"),
             "file_name": file_name,
             "language": language,
             "duration": duration,
+            "segments": segments,
+            "audio": audio,
         }
         _save_history_index(index)
-    return transcript_id
+
+
+def _audio_path(transcript_id):
+    """Audiodatei zu einer Verlaufs-ID, nur über den Index aufgelöst."""
+    with _history_lock:
+        meta = _load_history_index().get(transcript_id)
+    path = _audio_file(meta) if meta else None
+    return path if path and path.is_file() else None
 
 
 def _list_history():
@@ -397,7 +480,12 @@ def _list_history():
     for transcript_id, meta in index.items():
         path = Path(meta.get("path", ""))
         if path.is_file():
-            entries.append({**meta, "id": transcript_id})
+            audio = _audio_file(meta)
+            has_audio = bool(audio and audio.is_file())
+            entries.append({
+                **meta, "id": transcript_id, "audio": has_audio,
+                "audio_type": AUDIO_TYPES.get(audio.suffix.lower(), "") if has_audio else "",
+            })
             seen.add(path.resolve())
     if DEFAULT_OUTPUT_DIR.is_dir():
         for path in DEFAULT_OUTPUT_DIR.glob("*.txt"):
@@ -422,7 +510,9 @@ def _delete_from_history(transcript_id):
     with _history_lock:
         index = _load_history_index()
         if transcript_id in index:
-            path = Path(index.pop(transcript_id)["path"])
+            meta = index.pop(transcript_id)
+            path = Path(meta["path"])
+            _remove_audio(meta)
             _save_history_index(index)
         elif transcript_id.startswith("file:"):
             name = transcript_id[len("file:"):]
@@ -533,6 +623,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/transcripts":
             self._json_response(_list_history())
+            return
+
+        if parsed.path == "/audio":
+            query = parse_qs(parsed.query)
+            path = _audio_path(query.get("id", [""])[0])
+            if path is not None and "compat" in query:
+                path = _compat_audio(path)
+            if path is None:
+                self.send_error(404)
+                return
+            if path.name.endswith(COMPAT_SUFFIX):
+                content_type = "audio/mp4"
+            else:
+                content_type = AUDIO_TYPES.get(path.suffix.lower(), "application/octet-stream")
+            self._send_file(path, content_type)
             return
 
         if parsed.path in STATIC_FILES:
@@ -742,6 +847,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ).start()
 
         self._json_response({"job_id": job_id})
+
+    def _send_file(self, path, content_type):
+        """Schickt eine Datei, auf Wunsch nur einen Ausschnitt (Range).
+
+        WebKit fragt Audio in Ausschnitten an und spielt ohne Range-Unterstützung nicht bzw. kann nicht spulen.
+        """
+        size = path.stat().st_size
+        start, end, status = 0, size - 1, 200
+        requested = self.headers.get("Range")
+        if requested:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested.strip())
+            if match and match.group(1):
+                start = int(match.group(1))
+                end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+            elif match and match.group(2):
+                start = max(0, size - int(match.group(2)))  # bytes=-N: die letzten N Bytes
+            if not match or not (match.group(1) or match.group(2)) or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            status = 206
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", end - start + 1)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # der Browser bricht Ausschnitte oft ab, sobald er genug hat
 
     def _json_response(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")

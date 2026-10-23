@@ -185,14 +185,165 @@ async function copyText(text, button) {
   setTimeout(() => { button.textContent = label; }, 2000);
 }
 
+// ---------- Abspielen ----------
+
+// Ein Player für alle Karten: Startet eine andere Karte, stoppt die vorige
+const player = { audio: new Audio(), id: null, segments: [], raf: 0 };
+player.audio.preload = 'metadata';
+
+const cardById = (id) => $('historyList').querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+
+function currentSegment(segments, time) {
+  // Der Abschnitt bleibt markiert, bis der nächste beginnt (auch über kurze Pausen hinweg)
+  let index = -1;
+  for (let i = 0; i < segments.length && segments[i][0] <= time + 0.05; i++) index = i;
+  return index;
+}
+
+function updatePlayerUI() {
+  const card = player.id && cardById(player.id);
+  if (!card) return;
+  const { audio } = player;
+  const total = Number.isFinite(audio.duration) ? audio.duration : Number(card.dataset.duration) || 0;
+  const btn = card.querySelector('.play-btn');
+  btn.textContent = audio.paused ? '▶' : '❚❚';
+  btn.setAttribute('aria-label', audio.paused ? 'Abspielen' : 'Pause');
+  card.querySelector('.player-time').textContent =
+    `${formatDuration(Math.floor(audio.currentTime))} / ${formatDuration(Math.round(total))}`;
+  card.querySelector('.player-fill').style.width = total ? `${Math.min(100, (audio.currentTime / total) * 100)}%` : '0%';
+
+  const index = audio.ended ? -1 : currentSegment(player.segments, audio.currentTime);
+  const previous = card.querySelector('.seg.spoken');
+  const next = index >= 0 && (audio.currentTime > 0 || !audio.paused) ? card.querySelector(`.seg[data-index="${index}"]`) : null;
+  if (previous !== next) {
+    previous?.classList.remove('spoken');
+    next?.classList.add('spoken');
+    if (next && !audio.paused) {
+      const rect = next.getBoundingClientRect();
+      if (rect.top < 0 || rect.bottom > window.innerHeight) next.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+}
+
+function tick() {
+  updatePlayerUI();
+  if (!player.audio.paused) player.raf = requestAnimationFrame(tick);
+}
+
+player.audio.addEventListener('play', () => {
+  cancelAnimationFrame(player.raf);
+  player.raf = requestAnimationFrame(tick);
+});
+['pause', 'seeked', 'loadedmetadata', 'timeupdate'].forEach((event) => player.audio.addEventListener(event, updatePlayerUI));
+player.audio.addEventListener('ended', () => {
+  updatePlayerUI();
+  player.audio.currentTime = 0;  // bereit zum erneuten Abspielen
+});
+player.audio.addEventListener('error', () => {
+  const card = player.id && cardById(player.id);
+  if (card && player.audio.getAttribute('src')) card.querySelector('.player-time').textContent = 'Abspielen nicht möglich';
+});
+
+function stopPlayer() {
+  player.audio.pause();
+  player.audio.removeAttribute('src');
+  player.audio.load();
+  player.id = null;
+  player.segments = [];
+}
+
+function playFrom(t, time) {
+  if (player.id !== t.id) {
+    const previous = player.id && cardById(player.id);
+    stopPlayer();
+    if (previous) {
+      previous.querySelector('.seg.spoken')?.classList.remove('spoken');
+      previous.querySelector('.play-btn').textContent = '▶';
+      previous.querySelector('.player-fill').style.width = '0%';
+    }
+    player.id = t.id;
+    player.segments = t.segments || [];
+    // Die Original-Aufnahme abspielen; nur wenn das Fenster ihr Format nicht kann, eine umgewandelte Fassung
+    const playable = t.audio_type && player.audio.canPlayType(t.audio_type) !== '';
+    player.audio.src = `/audio?id=${encodeURIComponent(t.id)}${playable ? '' : '&compat=1'}`;
+  }
+  if (time !== undefined) {
+    // Vor dem Laden der Metadaten lässt sich die Position noch nicht setzen
+    if (player.audio.readyState >= 1) player.audio.currentTime = time;
+    else player.audio.addEventListener('loadedmetadata', () => { player.audio.currentTime = time; }, { once: true });
+  }
+  cardById(t.id)?.querySelector('.card-text').classList.remove('clamped');
+  player.audio.play().catch(() => {});
+  updatePlayerUI();
+}
+
+function togglePlay(t) {
+  if (player.id === t.id && !player.audio.paused) player.audio.pause();
+  else playFrom(t);
+}
+
+function createPlayer(t) {
+  const row = document.createElement('div');
+  row.className = 'player';
+  const btn = Object.assign(document.createElement('button'), {
+    className: 'ghost-btn play-btn', type: 'button', textContent: '▶',
+  });
+  btn.setAttribute('aria-label', 'Abspielen');
+  btn.addEventListener('click', () => togglePlay(t));
+  const track = document.createElement('div');
+  track.className = 'player-track';
+  track.title = 'Klicken, um zu dieser Stelle zu springen';
+  const bar = document.createElement('div');
+  bar.className = 'player-bar';
+  const fill = document.createElement('div');
+  fill.className = 'player-fill';
+  bar.append(fill);
+  track.append(bar);
+  track.addEventListener('click', (e) => {
+    const rect = bar.getBoundingClientRect();
+    const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const total = player.id === t.id && Number.isFinite(player.audio.duration) ? player.audio.duration : t.duration || 0;
+    playFrom(t, fraction * total);
+  });
+  const time = document.createElement('span');
+  time.className = 'player-time';
+  time.textContent = `0:00 / ${formatDuration(t.duration) || '–'}`;
+  row.append(btn, track, time);
+  return row;
+}
+
+function fillText(textEl, t) {
+  const segments = t.segments || [];
+  // Abschnitte nur nutzen, wenn sie zum Text passen (die .txt kann im Finder bearbeitet worden sein)
+  const start = segments.length ? (t.text || '').indexOf(segments[0][2]) : -1;
+  if (start < 0 || !t.audio) {
+    textEl.textContent = t.text || '(kein Text erkannt)';
+    return;
+  }
+  textEl.append(t.text.slice(0, start));  // Präfix mit Zeitstempel/Name
+  segments.forEach(([from, , words], index) => {
+    const span = Object.assign(document.createElement('span'), { className: 'seg', textContent: words });
+    span.dataset.index = index;
+    span.title = 'Ab hier abspielen';
+    span.addEventListener('click', (e) => {
+      if (window.getSelection().toString()) return;  // Text markieren statt springen
+      e.stopPropagation();
+      playFrom(t, from);
+    });
+    textEl.append(span, index < segments.length - 1 ? ' ' : '');
+  });
+}
+
 function renderHistory(freshId) {
   const list = history;
+  if (player.id && !list.some((t) => t.id === player.id)) stopPlayer();  // abspielendes Transkript gelöscht
   $('emptyState').hidden = list.length > 0;
   $('historyCount').textContent = list.length ? `${list.length} gespeichert` : '';
   $('historyList').replaceChildren(...list.map((t) => {
     const li = document.createElement('li');
     li.className = 'card' + (t.id === freshId ? ' fresh' : '');
     li.dataset.id = t.id;
+    if (t.duration) li.dataset.duration = t.duration;
 
     const meta = document.createElement('div');
     meta.className = 'card-meta';
@@ -209,8 +360,9 @@ function renderHistory(freshId) {
     }
 
     const text = document.createElement('p');
-    text.className = 'card-text' + (t.id === freshId ? '' : ' clamped');
-    text.textContent = t.text || '(kein Text erkannt)';
+    const open = t.id === freshId || t.id === player.id;
+    text.className = 'card-text' + (open ? '' : ' clamped');
+    fillText(text, t);
     text.title = 'Antippen zum Auf-/Zuklappen';
     text.addEventListener('click', () => {
       if (!window.getSelection().toString()) text.classList.toggle('clamped');
@@ -230,7 +382,9 @@ function renderHistory(freshId) {
     });
     actions.append(copy, del);
 
-    li.append(meta, text);
+    li.append(meta);
+    if (t.audio) li.append(createPlayer(t));
+    li.append(text);
     if (t.saved_as && !config.app) {
       const saved = document.createElement('div');
       saved.className = 'card-saved';
@@ -240,6 +394,8 @@ function renderHistory(freshId) {
     li.append(actions);
     return li;
   }));
+
+  updatePlayerUI();  // neu aufgebaute Karte wieder an die laufende Wiedergabe binden
 
   if (freshId) {
     const card = $('historyList').querySelector('.card.fresh');

@@ -21,7 +21,7 @@ All app data lives in one folder, `~/Library/Application Support/Transcribe`:
 
 | Folder or file   | Content                                  |
 |------------------|------------------------------------------|
-| `Transkripte/`   | Transcriptions as `.txt`, plus the index of the history |
+| `Transkripte/`   | Transcriptions as `.txt`, the history index, and the original audio files for playback (`.audio/`) |
 | `huggingface/`   | Downloaded Whisper models                |
 | `cache/`         | Compiled code cache, if one is needed    |
 | `transcribe.log` | Log file                                 |
@@ -46,6 +46,7 @@ The window settings (engine, model, language) remain as a few hundred KB of WebK
 - Optional speaker name prefix in output
 - Timestamp extracted automatically from filename (WhatsApp format supported)
 - History of past transcriptions with copy and delete, based on the saved `.txt` files
+- Play back a transcribed message: the passage being spoken is highlighted, and clicking a passage jumps there
 - Saves each transcription as a `.txt` file in `transcriptions/` or in a folder of your choice
 - Works on macOS, Windows, and Linux
 - GPU acceleration when available (Apple Silicon via MLX or MPS, CUDA), CPU fallback otherwise
@@ -53,6 +54,7 @@ The window settings (engine, model, language) remain as a few hundred KB of WebK
 ## Privacy
 
 - Audio files and transcriptions never leave your machine.
+- For playback, the original audio file is kept next to its transcription and deleted together with it.
 - The web UI is served on `127.0.0.1` only, so other devices on your network cannot reach it. Requests coming from other websites are rejected.
 - The page loads no external resources: no fonts, scripts, or analytics.
 - An internet connection is needed only to install the dependencies on the first run and to download each Whisper model the first time you select it.
@@ -103,6 +105,8 @@ The script then starts a local server and opens the web UI at `http://127.0.0.1:
 4. Click `Starten`.
 
 To stop a transcription, click `Abbrechen` below its progress bar. Whisper works through the audio in sections of about 30 seconds, so a running transcription stops at the end of the current section.
+
+To listen to a transcribed message, click ▶ on its card in the history. The passage currently being spoken is highlighted; click any passage to jump there, or click the progress bar. Transcriptions made before version 1.1.0 have no playback, because their audio was not kept.
 
 The result appears in the history (`Verlauf`) on the page and is saved as a `.txt` file named after the audio file. By default it goes to the `transcriptions/` folder inside the project directory. To save it elsewhere, enter the full path of an existing folder in `Ausgabeordner` (`~` is supported). An existing `.txt` with the same name is overwritten.
 
@@ -191,7 +195,7 @@ The app entry point is `macos_app.py`. It starts the same server as `transcribe.
 
 ### Releasing
 
-1. Raise `VERSION` in `transcribe.py` and commit.
+1. Raise `VERSION` in `transcribe.py` and add a section for the new version to `CHANGELOG.md`; commit both.
 2. Tag and push:
 
    ```bash
@@ -199,7 +203,7 @@ The app entry point is `macos_app.py`. It starts the same server as `transcribe.
    git push origin main v1.2.3
    ```
 
-The workflow `.github/workflows/release.yml` builds the app on GitHub Actions and publishes a release with the DMG and its SHA-256 checksum. It fails if the tag does not match `VERSION`. To build a test DMG without publishing, start the workflow manually under **Actions → macOS App → Run workflow**; the DMG is then attached to the run as an artifact.
+The workflow `.github/workflows/release.yml` builds the app on GitHub Actions and publishes a release with the DMG and its SHA-256 checksum. The release notes start with the version's section from `CHANGELOG.md`, followed by the download instructions from `packaging/macos/release-notes.md`. The workflow fails if the tag does not match `VERSION` or the changelog has no section for it. To build a test DMG without publishing, start the workflow manually under **Actions → macOS App → Run workflow**; the DMG is then attached to the run as an artifact.
 
 ## Troubleshooting
 
