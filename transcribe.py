@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.2"  # muss zum Release-Tag vX.Y.Z passen
+VERSION = "1.1.0"  # muss zum Release-Tag vX.Y.Z passen
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
