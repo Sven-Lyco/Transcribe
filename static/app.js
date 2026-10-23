@@ -205,11 +205,17 @@ function updatePlayerUI() {
   if (!card) return;
   const { audio } = player;
   const total = Number.isFinite(audio.duration) ? audio.duration : Number(card.dataset.duration) || 0;
+  // Nur ändern, was sich geändert hat: Wird der Button-Text während eines Klicks ersetzt
+  // (das hier läuft bis zu 60-mal pro Sekunde), verwirft WebKit den Klick.
   const btn = card.querySelector('.play-btn');
-  btn.textContent = audio.paused ? '▶' : '❚❚';
-  btn.setAttribute('aria-label', audio.paused ? 'Abspielen' : 'Pause');
-  card.querySelector('.player-time').textContent =
-    `${formatDuration(Math.floor(audio.currentTime))} / ${formatDuration(Math.round(total))}`;
+  const label = audio.paused ? '▶' : '❚❚';
+  if (btn.textContent !== label) {
+    btn.textContent = label;
+    btn.setAttribute('aria-label', audio.paused ? 'Abspielen' : 'Pause');
+  }
+  const time = card.querySelector('.player-time');
+  const timeText = `${formatDuration(Math.floor(audio.currentTime))} / ${formatDuration(Math.round(total))}`;
+  if (time.textContent !== timeText) time.textContent = timeText;
   card.querySelector('.player-fill').style.width = total ? `${Math.min(100, (audio.currentTime / total) * 100)}%` : '0%';
 
   const index = audio.ended ? -1 : currentSegment(player.segments, audio.currentTime);

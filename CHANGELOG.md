@@ -5,11 +5,12 @@ Changes to Transcribe, newest first. Each version matches a release tag `vX.Y.Z`
 ## [1.1.0] – 2026-10-23
 
 ### New
-- Play back the original voice message from the history. The passage being spoken is highlighted while it plays; click a passage or the progress bar to jump there.
+- Play back the original voice message from the history. The sentence being spoken is highlighted while it plays; click a sentence or the progress bar to jump there.
 
 ### Notes
 - The original audio file is now kept next to its transcription (WhatsApp voice messages typically take about 100–250 KB per minute) and deleted together with it.
 - Transcriptions made with earlier versions have no playback, because their audio was not kept.
+- Transcription now also computes word timings so the highlighting matches the audio closely (usually within 0.2 seconds). This makes it take about twice as long.
 
 ## [1.0.2] – 2026-10-23
 

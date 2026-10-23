@@ -203,6 +203,17 @@ def load_engines():
         print("=" * 50)
         sys.exit(1)
 
+    if "openai" in _engines:
+        # Für die Wort-Zeitstempel wandelt openai-whisper erst in float64 um und holt die Daten dann
+        # auf die CPU; float64 gibt es auf MPS (Apple-GPU) nicht, also vorher auf die CPU holen
+        import whisper.timing as whisper_timing
+        original_dtw = whisper_timing.dtw
+
+        def dtw_on_cpu(x):
+            return original_dtw(x.cpu())
+
+        whisper_timing.dtw = dtw_on_cpu
+
     # Beide Engines zeigen ihren Fortschritt über tqdm.tqdm an
     _orig_tqdm = _tqdm_module.tqdm
 
@@ -232,12 +243,15 @@ def _load_openai_model(model_name):
         device = "cpu"
 
     print(f"  → Lade Modell '{model_name}'...")
-    # Auf CPU laden und alignment_heads (sparse Tensor) in dense umwandeln,
+    # Auf CPU laden und alignment_heads (sparse Tensor) für den Umzug in dense umwandeln,
     # da MPS keine sparse Tensoren unterstützt (siehe pytorch/pytorch#78168).
     model = _engines["openai"].load_model(model_name, device="cpu")
     if device != "cpu":
-        model.alignment_heads = model.alignment_heads.to_dense()
+        heads = model.alignment_heads
+        model.alignment_heads = heads.to_dense()
         model = model.to(device)
+        # Die Wort-Zeitstempel lesen daraus nur die Indizes (.indices()), dafür genügt sparse auf der CPU
+        model.alignment_heads = heads
 
     _models[model_name] = model
     return model
@@ -296,7 +310,8 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
                 _jobs[job_id]["state"] = "running"
             print(f"  → Transkribiere '{file_name}' mit {engine}/{model_name}...")
             # verbose=False zeigt den tqdm-Fortschritt, über den Fortschritt und Abbruch laufen
-            kwargs = {"verbose": False}
+            # word_timestamps: genaue Zeiten für die Hervorhebung beim Abspielen (dauert etwa doppelt so lang)
+            kwargs = {"verbose": False, "word_timestamps": True}
             if language != "auto":
                 kwargs["language"] = language
             transcribe = _transcribe_mlx if engine == "mlx" else _transcribe_openai
@@ -331,11 +346,7 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
         txt_path = save_dir / (Path(file_name).stem + ".txt")
         txt_path.write_text(formatted_text, encoding="utf-8")
         transcript_id = uuid.uuid4().hex
-        # Abschnitte mit Zeiten, damit der Player den gerade gesprochenen Text hervorheben kann
-        segments = [
-            [round(seg["start"], 2), round(seg["end"], 2), seg["text"].strip()]
-            for seg in result.get("segments", []) if seg.get("text", "").strip()
-        ]
+        segments = _passages(result)
         audio = _keep_original_audio(tmp_path, transcript_id)
         _add_to_history(transcript_id, txt_path, file_name, lang, duration, segments, audio)
         print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
@@ -381,6 +392,42 @@ def _save_history_index(index):
     tmp = HISTORY_INDEX.with_suffix(".tmp")
     tmp.write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(HISTORY_INDEX)
+
+
+PASSAGE_SPLIT_AFTER = 8   # Sekunden; danach wird ein langer Satz an einem Komma geteilt
+PASSAGE_MAX = 15          # Sekunden; spätestens dann beginnt ein neuer Abschnitt
+
+
+def _passages(result):
+    """Abschnitte für die Hervorhebung beim Abspielen: [start, ende, text], meist ganze Sätze.
+
+    Die Zeiten kommen aus den Wort-Zeitstempeln. Whispers eigene Abschnitte sind deutlich ungenauer
+    (teils über eine Sekunde daneben) und enden oft mitten im Satz.
+    """
+    passages, words = [], []
+
+    def flush():
+        if words:
+            text = "".join(w["word"] for w in words).strip()
+            passages.append([round(words[0]["start"], 2), round(words[-1]["end"], 2), text])
+            words.clear()
+
+    for segment in result.get("segments", []):
+        if not segment.get("words"):  # ohne Wortzeiten Whispers Abschnitt übernehmen
+            flush()
+            if segment.get("text", "").strip():
+                passages.append([round(segment["start"], 2), round(segment["end"], 2), segment["text"].strip()])
+            continue
+        for word in segment["words"]:
+            words.append(word)
+            token = word["word"].strip()
+            length = word["end"] - words[0]["start"]
+            if (token.endswith((".", "?", "!", "…"))
+                    or (length > PASSAGE_SPLIT_AFTER and token.endswith((",", ";", ":")))
+                    or length > PASSAGE_MAX):
+                flush()
+    flush()
+    return passages
 
 
 def _keep_original_audio(src, transcript_id):
