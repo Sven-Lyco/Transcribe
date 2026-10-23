@@ -310,6 +310,7 @@ function createStatus() {
   bar.append(fill);
   el.append(title, detail, bar);
   jobsEl.append(el);
+  let cancelBtn = null;
 
   return {
     el,
@@ -320,7 +321,15 @@ function createStatus() {
     },
     detail(text) { detail.textContent = text; },
     progress(value) { fill.style.width = `${value}%`; },
+    cancellable(onCancel) {
+      cancelBtn = Object.assign(document.createElement('button'), {
+        className: 'ghost-btn danger', type: 'button', textContent: 'Abbrechen',
+      });
+      cancelBtn.addEventListener('click', onCancel);
+      el.append(cancelBtn);
+    },
     fail(heading, message) {
+      if (cancelBtn) cancelBtn.remove();
       el.classList.add('failed');
       title.textContent = `❌ ${heading}`;
       detail.textContent = message;
@@ -348,6 +357,16 @@ function watchJob(job) {
     clearTimeout(watcher.timer);
     watchers.delete(job.id);
   };
+
+  // Löscht den Job auf dem Server: Wartet er noch, startet er nicht mehr,
+  // läuft er schon, hört der Server nach dem aktuellen Abschnitt (ca. 30 s Audio) auf.
+  status.cancellable(() => {
+    if (!confirm('Transkription abbrechen?')) return;
+    stop();
+    removePending(job.id);
+    fetch(`/job?job=${encodeURIComponent(job.id)}`, { method: 'DELETE' }).catch(() => {});
+    status.el.remove();
+  });
 
   const connect = () => {
     watcher.es = new EventSource(`/progress?job=${encodeURIComponent(job.id)}`);
@@ -464,6 +483,8 @@ startBtn.addEventListener('click', async () => {
   const upload = createStatus();
   upload.busy(file.name);
   upload.detail('Datei wird übertragen …');
+  const controller = new AbortController();
+  upload.cancellable(() => controller.abort());
 
   const formData = new FormData();
   formData.append('file', file);
@@ -477,6 +498,7 @@ startBtn.addEventListener('click', async () => {
       method: 'POST',
       body: formData,
       headers: config.hosted ? { Authorization: `Bearer ${token}` } : {},
+      signal: controller.signal,
     });
     const data = await response.json();
     if (data.error) {
@@ -494,7 +516,8 @@ startBtn.addEventListener('click', async () => {
     $('fileInfo').textContent = '';
     speakerNameInput.value = '';
   } catch (err) {
-    upload.fail('Verbindungsfehler', err.message);
+    if (err.name === 'AbortError') upload.el.remove();
+    else upload.fail('Verbindungsfehler', err.message);
     startBtn.disabled = false;
   }
 });

@@ -81,6 +81,8 @@ The script then starts a local server and opens the web UI at `http://127.0.0.1:
 3. Optional: enter a speaker name (`Name`).
 4. Click `Starten`.
 
+To stop a transcription, click `Abbrechen` below its progress bar. Whisper works through the audio in sections of about 30 seconds, so a running transcription stops at the end of the current section.
+
 The result appears in the history (`Verlauf`) on the page and is saved as a `.txt` file named after the audio file. By default it goes to the `transcriptions/` folder inside the project directory. To save it elsewhere, enter the full path of an existing folder in `Ausgabeordner` (`~` is supported). An existing `.txt` with the same name is overwritten.
 
 ### Custom port
@@ -235,7 +237,7 @@ The model is being downloaded. Later runs use the cached copy.
 The token in the web app settings or in the Shortcut does not match `TRANSCRIBE_TOKEN` on the server.
 
 **`Job nicht gefunden` (hosted mode)**
-The result was not fetched within 15 minutes, or the server was restarted in the meantime. Share the voice message again.
+The transcription was cancelled, the result was not fetched within 15 minutes, or the server was restarted in the meantime. Share the voice message again.
 
 **`Server ausgelastet` (hosted mode)**
 Five transcriptions are already queued or running. Wait a few minutes and try again.

@@ -140,10 +140,25 @@ _models: dict = {}  # zuletzt benutztes Modell, bleibt zwischen den Jobs geladen
 _transcribe_lock = threading.Lock()  # immer nur eine Transkription, sonst bremsen sich die Jobs aus
 
 
+class JobCancelled(Exception):
+    """Der Job wurde per DELETE /job abgebrochen, während er wartete oder lief."""
+
+
+def _raise_if_cancelled(job_id):
+    """Ein abgebrochener Job ist nicht mehr in _jobs. Aufruf mit gehaltenem _jobs_lock."""
+    if job_id not in _jobs:
+        raise JobCancelled
+
+
 def _set_progress(job_id, pct):
+    """Meldet den Fortschritt und bricht die Transkription ab, falls der Job gelöscht wurde.
+
+    Beide Engines rufen das nach jedem Abschnitt (ca. 30 s Audio) auf, darum greift ein
+    Abbruch spätestens nach dem aktuellen Abschnitt.
+    """
     with _jobs_lock:
-        if job_id in _jobs:
-            _jobs[job_id]["progress"] = max(0, min(99, int(pct)))
+        _raise_if_cancelled(job_id)
+        _jobs[job_id]["progress"] = max(0, min(99, int(pct)))
 
 
 def load_whisper():
@@ -288,13 +303,14 @@ def _transcribe_faster(job_id, model, data, language):
 
 def _run_transcription(job_id, model_name, audio, language, speaker_name, output_folder, file_name):
     """`audio` ist gehostet der Dateiinhalt (bleibt im Speicher), lokal der Pfad einer Temp-Datei."""
+    label = f"Job {job_id[:8]}" if HOSTED else repr(file_name)  # gehostet keine Dateinamen ins Log
     try:
         with _transcribe_lock:
             with _jobs_lock:
+                _raise_if_cancelled(job_id)  # schon abgebrochen, während der Job wartete
                 _jobs[job_id]["state"] = "running"
             model = _get_model(model_name)
-            # Gehostet keine Dateinamen ins Log schreiben
-            print(f"  → Transkribiere {'Job ' + job_id[:8] if HOSTED else repr(file_name)}...")
+            print(f"  → Transkribiere {label}...")
             transcribe = _transcribe_faster if HOSTED else _transcribe_openai
             text, lang, duration = transcribe(job_id, model, audio, language)
 
@@ -312,6 +328,9 @@ def _run_transcription(job_id, model_name, audio, language, speaker_name, output
 
         formatted_text = f"{prefix}: {text}" if prefix else text
 
+        with _jobs_lock:
+            _raise_if_cancelled(job_id)  # kurz vor Schluss abgebrochen: nichts mehr speichern
+
         saved_as = None
         if not HOSTED:
             if output_folder and Path(output_folder).is_dir():
@@ -327,26 +346,30 @@ def _run_transcription(job_id, model_name, audio, language, speaker_name, output
             print(f"  ✓ Job {job_id[:8]} fertig")
 
         with _jobs_lock:
-            _jobs[job_id].update({
-                "progress": 100,
-                "done": True,
-                "finished_at": time.time(),
-                "result": {
-                    "text": formatted_text,
-                    "language": lang,
-                    "duration": duration,
-                    "saved_as": saved_as,
-                },
-            })
+            if job_id in _jobs:
+                _jobs[job_id].update({
+                    "progress": 100,
+                    "done": True,
+                    "finished_at": time.time(),
+                    "result": {
+                        "text": formatted_text,
+                        "language": lang,
+                        "duration": duration,
+                        "saved_as": saved_as,
+                    },
+                })
+    except JobCancelled:
+        print(f"  ⏹ {label} abgebrochen")
     except Exception as e:
         if isinstance(e, TranscriptionError) or not HOSTED:
             message = str(e)
         else:
             # Interne Details (Pfade, Bibliotheksfehler) nur ins Server-Log
-            print(f"  ✗ Job {job_id[:8]} fehlgeschlagen: {e!r}")
+            print(f"  ✗ {label} fehlgeschlagen: {e!r}")
             message = "Transkription fehlgeschlagen. Details stehen im Server-Log."
         with _jobs_lock:
-            _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
+            if job_id in _jobs:
+                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
     finally:
         if not HOSTED:
             os.unlink(audio)
@@ -462,7 +485,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     payload = {
                         "type": "error",
                         "gone": True,
-                        "message": "Job nicht gefunden – abgelaufen oder Server neu gestartet.",
+                        "message": "Job nicht gefunden – abgebrochen, abgelaufen oder Server neu gestartet.",
                     }
                 elif job.get("done"):
                     if job.get("error"):
@@ -488,7 +511,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True  # Stream ist zu Ende, nicht auf weitere Anfragen warten
 
     def do_DELETE(self):
-        """Die Seite hat das Ergebnis gespeichert, der Server vergisst es."""
+        """Die Seite hat das Ergebnis gespeichert oder bricht den Job ab: Der Server vergisst ihn.
+
+        Ein wartender Job startet dann nicht mehr, ein laufender hört nach dem aktuellen Abschnitt auf.
+        """
         if not self._is_local_request():
             self.send_error(403)
             return
@@ -498,9 +524,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         job_id = parse_qs(parsed.query).get("job", [None])[0]
         with _jobs_lock:
-            job = _jobs.get(job_id)
-            if job and job["done"]:
-                del _jobs[job_id]
+            _jobs.pop(job_id, None)
         self.send_response(204)
         self.end_headers()
 
