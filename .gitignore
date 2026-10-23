@@ -6,3 +6,7 @@ __pycache__/
 # Transcription output (local, may contain private content)
 transcriptions/*
 !transcriptions/.gitkeep
+
+# Mac-App (packaging/macos/build.sh)
+build/
+dist/

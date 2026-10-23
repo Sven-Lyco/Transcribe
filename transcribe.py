@@ -17,6 +17,7 @@ Anderer Port:
 import argparse
 import errno
 import http.server
+import importlib
 import socketserver
 import json
 import os
@@ -33,6 +34,8 @@ import webbrowser
 import glob
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+VERSION = "1.0.0"  # muss zum Release-Tag vX.Y.Z passen
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -75,7 +78,11 @@ JOB_TTL = 15 * 60  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Sp
 SOCKET_TIMEOUT = 60  # Sekunden ohne Datenfluss, bevor eine Verbindung aufgegeben wird
 MAX_FILE_NAME = 200
 
-STATIC_DIR = Path(__file__).parent / "static"
+# In der Mac-App (PyInstaller) liegen die Dateien unter sys._MEIPASS
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+STATIC_DIR = BASE_DIR / "static"
+# Die Mac-App setzt einen beschreibbaren Ordner, das App-Bundle selbst ist schreibgeschützt
+DEFAULT_OUTPUT_DIR = Path(os.environ.get("TRANSCRIBE_OUTPUT_DIR") or Path(__file__).parent / "transcriptions")
 # Ausgelieferte Dateien: Pfad -> (Datei, Content-Type)
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -160,14 +167,14 @@ def _set_progress(job_id, pct):
 
 def load_engines():
     """Importiert die installierten Engines und leitet ihre Fortschrittsbalken an den laufenden Job weiter."""
-    import importlib
     import tqdm as _tqdm_module
 
     for name, engine in ENGINES.items():
         try:
             _engines[name] = importlib.import_module(engine["module"])
-        except ImportError:
-            pass  # nicht installiert
+        except ImportError as e:
+            if e.name != engine["module"]:  # installiert, aber eine Abhängigkeit fehlt
+                print(f"  {engine['label']} ist installiert, lässt sich aber nicht laden: {e}")
         except Exception as e:
             print(f"  {engine['label']} ist installiert, lässt sich aber nicht laden: {e}")
 
@@ -221,16 +228,35 @@ def _load_openai_model(model_name):
     return model
 
 
-def _transcribe_openai(model_name, path, kwargs):
+def _transcribe_openai(job_id, model_name, path, kwargs):
     model = _load_openai_model(model_name)
     # fp16 nur auf CUDA aktivieren: Apples MPS-Backend liefert bei manchen
     # Whisper-Modellen in fp16 NaN-Logits, daher dort auf fp32 bleiben.
     return model.transcribe(path, fp16=(model.device.type == "cuda"), **kwargs)
 
 
-def _transcribe_mlx(model_name, path, kwargs):
-    # Lädt das Modell beim ersten Gebrauch (Download über Hugging Face) und hält es danach selbst im Speicher
+def _ensure_mlx_model(job_id, repo):
+    """Lädt ein noch nicht vorhandenes Modell vorab herunter, damit die Oberfläche das anzeigen kann."""
+    from huggingface_hub import snapshot_download
+    try:
+        snapshot_download(repo, local_files_only=True)
+        return
+    except Exception:
+        pass  # noch nicht im Cache
+    with _jobs_lock:
+        _raise_if_cancelled(job_id)
+        _jobs[job_id]["state"] = "downloading"
+    print(f"  → Lade Modell {repo} herunter...")
+    snapshot_download(repo)
+    with _jobs_lock:
+        _raise_if_cancelled(job_id)
+        _jobs[job_id]["state"] = "running"
+
+
+def _transcribe_mlx(job_id, model_name, path, kwargs):
+    # mlx-whisper hält das geladene Modell danach selbst im Speicher
     repo = ENGINES["mlx"]["models"][model_name]
+    _ensure_mlx_model(job_id, repo)
     return _engines["mlx"].transcribe(path, path_or_hf_repo=repo, **kwargs)
 
 
@@ -259,7 +285,7 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
             if language != "auto":
                 kwargs["language"] = language
             transcribe = _transcribe_mlx if engine == "mlx" else _transcribe_openai
-            result = transcribe(model_name, tmp_path, kwargs)
+            result = transcribe(job_id, model_name, tmp_path, kwargs)
 
         text = result["text"].strip()
         lang = result.get("language", "?")
@@ -285,8 +311,8 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
         if output_folder and Path(output_folder).is_dir():
             save_dir = Path(output_folder)
         else:
-            save_dir = Path(__file__).parent / "transcriptions"
-            save_dir.mkdir(exist_ok=True)
+            save_dir = DEFAULT_OUTPUT_DIR
+            save_dir.mkdir(parents=True, exist_ok=True)
         txt_path = save_dir / (Path(file_name).stem + ".txt")
         txt_path.write_text(formatted_text, encoding="utf-8")
         print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
@@ -307,9 +333,14 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
     except JobCancelled:
         print(f"  ⏹ '{file_name}' abgebrochen")
     except Exception as e:
+        message = str(e)
+        if message.startswith("Failed to load audio"):
+            # Beide Engines hängen die komplette ffmpeg-Ausgabe an, die gehört nur ins Log
+            print(f"  ✗ '{file_name}': {message}")
+            message = "Audio konnte nicht gelesen werden (beschädigt, unbekanntes Format oder keine Tonspur)."
         with _jobs_lock:
             if job_id in _jobs:
-                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": str(e)})
+                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
     finally:
         os.unlink(tmp_path)
 
@@ -378,6 +409,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ],
                 "default_engine": next(iter(_engines)),
                 "languages": LANGUAGES,
+                "version": VERSION,
             })
             return
 
@@ -678,8 +710,9 @@ def bind_server(port):
     return httpd
 
 
-def create_server(port):
-    """Startet den Server. Ist der Port nicht verfügbar, wird nach einem anderen gefragt."""
+def create_server(port, interactive=True):
+    """Startet den Server. Ist der Port nicht verfügbar, wird nach einem anderen gefragt,
+    oder ohne Rückfrage (interactive=False, z.B. in der Mac-App) der nächste freie genommen."""
     while True:
         try:
             return bind_server(port)
@@ -688,6 +721,13 @@ def create_server(port):
                 print(f"  Server konnte nicht gestartet werden: {e}")
                 sys.exit(1)
             print(f"  Port {port} ist nicht verfügbar ({e.strerror}).")
+            if not interactive:
+                free = find_free_ports(port + 1, count=1)
+                if not free:
+                    print("  Kein freier Port gefunden.")
+                    sys.exit(1)
+                port = free[0]
+                continue
             if not (sys.stdin and sys.stdin.isatty()):
                 print("  Mit --port einen anderen Port angeben.")
                 sys.exit(1)

@@ -321,6 +321,14 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
 
 .history { margin-top: 2.5rem; }
 
+.footer {
+  margin-top: 2.5rem;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
 .section-head {
   display: flex;
   justify-content: space-between;

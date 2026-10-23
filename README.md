@@ -6,6 +6,19 @@ On Macs with Apple Silicon it uses [mlx-whisper](https://github.com/ml-explore/m
 
 > **Note:** The web UI and the console messages are in German. The steps below name the German labels you will see.
 
+## Download for macOS
+
+Transcribe is available as a Mac app for **Apple Silicon (M1 or newer) with macOS 14 Sonoma or later**. No Python, Terminal, or ffmpeg needed.
+
+1. Download `Transcribe-<version>-arm64.dmg` from the [latest release](https://github.com/Sven-Lyco/Transcribe/releases/latest) and open it.
+2. Drag **Transcribe** into **Applications**.
+3. Open Transcribe. The app is not signed by Apple, so macOS blocks it the first time ("Apple could not verify …"). Click **Done**, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to Transcribe. This is needed only once.
+4. Drop an audio file into the window.
+
+The first transcription downloads the Whisper model (about 1.6 GB, cached in `~/.cache/huggingface` and shared with the script version). The app saves transcriptions in `~/Documents/Transkripte` and writes its log to `~/Library/Logs/Transcribe/transcribe.log`.
+
+On Intel Macs, Windows, and Linux, use the script version described under [Setup & Usage](#setup--usage).
+
 ## Features
 
 - Drag & drop audio files (OGG, MP3, WAV, M4A, OPUS, WebM)
@@ -142,6 +155,32 @@ WhatsApp Audio 2026-08-12 at 09.49.50.ogg
 2026-08-12 - 09.49.50 - Speaker Name: Transcribed text appears here.
 ```
 
+## Building the macOS app
+
+```bash
+packaging/macos/build.sh
+```
+
+This creates `dist/Transcribe.app` and `dist/Transcribe-<version>-arm64.dmg`. It needs a Mac with Apple Silicon, Python 3.12 or newer, and the Xcode Command Line Tools. The script
+
+- installs the app dependencies into `build/venv` (mlx-whisper without PyTorch, see `packaging/macos/requirements.txt`),
+- builds a minimal FFmpeg for audio decoding from source (`packaging/macos/build_ffmpeg.sh`; LGPL only, no GPL parts),
+- packs everything with PyInstaller (`packaging/macos/Transcribe.spec`) and signs the app ad hoc.
+
+The app entry point is `macos_app.py`. It starts the same server as `transcribe.py` and shows the UI in a native window using [pywebview](https://pywebview.flowrl.com).
+
+### Releasing
+
+1. Raise `VERSION` in `transcribe.py` and commit.
+2. Tag and push:
+
+   ```bash
+   git tag v1.2.3
+   git push origin main v1.2.3
+   ```
+
+The workflow `.github/workflows/release.yml` builds the app on GitHub Actions and publishes a release with the DMG and its SHA-256 checksum. It fails if the tag does not match `VERSION`. To build a test DMG without publishing, start the workflow manually under **Actions → macOS App → Run workflow**; the DMG is then attached to the run as an artifact.
+
 ## Troubleshooting
 
 **`Warnung: ffmpeg wurde nicht gefunden` at startup**
@@ -154,7 +193,10 @@ Another program is using the port. Choose one of the suggested ports, or start w
 The model is being downloaded. Later runs use the cached copy.
 
 **The engine selection is missing in the settings**
-Only one engine is installed. On Apple Silicon, run `pip install mlx-whisper` in the virtual environment, or start `./transcribe.sh`, which installs it automatically.
+Only one engine is installed. On Apple Silicon, run `pip install mlx-whisper` in the virtual environment, or start `./transcribe.sh`, which installs it automatically. The Mac app always uses mlx-whisper only.
+
+**The Mac app says it "is damaged and can't be opened"**
+The download was modified or incomplete. Download the DMG again and compare its checksum with `SHA256SUMS.txt` from the release (`shasum -a 256 Transcribe-*.dmg`).
 
 ## License
 

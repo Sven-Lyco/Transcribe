@@ -387,8 +387,9 @@ function watchJob(job) {
       if (msg.type === 'progress') {
         status.progress(msg.value);
         if (msg.state === 'queued') status.detail('In der Warteschlange …');
+        else if (msg.state === 'downloading') status.detail('Modell wird heruntergeladen (einmalig, bis zu ca. 1,6 GB) …');
         else if (msg.value > 0) status.detail(`Fortschritt: ${msg.value}%`);
-        else status.detail('Modell wird geladen & Transkription läuft … Beim ersten Mal kann das 1–2 Minuten dauern.');
+        else status.detail('Modell wird geladen & Transkription läuft …');
       } else if (msg.type === 'done') {
         stop();
         const entry = {
@@ -526,6 +527,7 @@ async function init() {
     if (response.ok) config = await response.json();
   } catch {}
   applyConfig();
+  if (config.version) $('version').textContent = `Transcribe ${config.version}`;
   loadSettings();
   renderHistory();
 
