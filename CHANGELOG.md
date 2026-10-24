@@ -2,7 +2,7 @@
 
 Changes to Transcribe, newest first. Each version matches a release tag `vX.Y.Z`; the release workflow copies the section of the tagged version into the GitHub release notes.
 
-## [Unreleased]
+## [1.3.0] – 2026-10-24
 
 ### New
 - Choose or drop several files at once. They are transcribed one after another in the order shown, and each waiting file shows how many are ahead of it.
