@@ -90,8 +90,25 @@ const TEXTS = {
     reconnecting: 'Verbindung unterbrochen – neuer Versuch …',
     connectionError: 'Verbindungsfehler',
     serverUnreachable: 'Server nicht erreichbar. Beim nächsten Öffnen der Seite wird es erneut versucht.',
-    removeSelection: 'Auswahl entfernen',
+    removeFile: (name) => `${name} entfernen`,
     uploading: 'Datei wird übertragen …',
+    startCount: (count) => `Starten (${count})`,
+    queuedAhead: (count) => `In der Warteschlange – ${count} davor …`,
+    downloadingProgress: (done, total) => `Modell wird heruntergeladen (einmalig): ${done} von ${total} …`,
+    searchPlaceholder: 'Im Verlauf suchen …',
+    searchLabel: 'Verlauf durchsuchen',
+    searchCount: (shown, total) => `${shown} von ${total}`,
+    noResults: 'Keine Treffer.',
+    edit: 'Bearbeiten',
+    save: 'Speichern',
+    editHint: '⌘/Strg+Enter speichert, Esc bricht ab',
+    saveFailed: 'Speichern fehlgeschlagen',
+    notifyDone: 'Transkription fertig',
+    notifyFailed: 'Transkription fehlgeschlagen',
+    checkUpdates: 'Beim Start nach Updates suchen',
+    updateAvailable: (version) => `Transcribe ${version} ist verfügbar.`,
+    updateDownload: 'Herunterladen',
+    dismiss: 'Ausblenden',
 
     error_bad_request: (detail) => `Ungültige Anfrage (${detail}).`,
     error_too_large: (gb) => `Datei zu groß (höchstens ${gb} GB).`,
@@ -103,6 +120,7 @@ const TEXTS = {
     error_job_gone: 'Job nicht gefunden – abgebrochen, abgelaufen oder Server neu gestartet.',
     error_unreadable_audio: 'Audio konnte nicht gelesen werden (beschädigt, unbekanntes Format oder keine Tonspur).',
     error_unsafe_data_dir: 'Der Datenordner gehört nicht nur der App.',
+    error_opened_gone: 'Die geöffnete Datei ist nicht mehr da.',
   },
   en: {
     title: 'Transcribe',
@@ -182,8 +200,25 @@ const TEXTS = {
     reconnecting: 'Connection lost – retrying …',
     connectionError: 'Connection error',
     serverUnreachable: 'Server not reachable. It will be tried again the next time the page is opened.',
-    removeSelection: 'Remove selection',
+    removeFile: (name) => `Remove ${name}`,
     uploading: 'Uploading the file …',
+    startCount: (count) => `Start (${count})`,
+    queuedAhead: (count) => `Waiting in line – ${count} ahead …`,
+    downloadingProgress: (done, total) => `Downloading the model (once): ${done} of ${total} …`,
+    searchPlaceholder: 'Search the history …',
+    searchLabel: 'Search the history',
+    searchCount: (shown, total) => `${shown} of ${total}`,
+    noResults: 'No matches.',
+    edit: 'Edit',
+    save: 'Save',
+    editHint: 'Cmd/Ctrl+Enter saves, Esc cancels',
+    saveFailed: 'Saving failed',
+    notifyDone: 'Transcription finished',
+    notifyFailed: 'Transcription failed',
+    checkUpdates: 'Check for updates at startup',
+    updateAvailable: (version) => `Transcribe ${version} is available.`,
+    updateDownload: 'Download',
+    dismiss: 'Dismiss',
 
     error_bad_request: (detail) => `Invalid request (${detail}).`,
     error_too_large: (gb) => `The file is too large (at most ${gb} GB).`,
@@ -195,6 +230,7 @@ const TEXTS = {
     error_job_gone: 'Job not found – cancelled, expired, or the server was restarted.',
     error_unreadable_audio: 'The audio could not be read (damaged, unknown format, or no audio track).',
     error_unsafe_data_dir: 'The data folder does not belong to the app alone.',
+    error_opened_gone: 'The opened file is no longer available.',
   },
 };
 
@@ -214,6 +250,19 @@ const languageOf = (code) => (String(code || '').toLowerCase().startsWith('de') 
 // Für Datum und Zahlen die Region des Browsers, wenn sie zur Sprache passt
 const locale = () => navigator.languages?.find((l) => l.toLowerCase().startsWith(lang)) || (lang === 'de' ? 'de-DE' : 'en-US');
 
+// Dateigrößen wie im Finder: 1000er-Schritte, MB mit einer und GB mit zwei Nachkommastellen
+function formatBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  const digits = [0, 0, 1, 2][unit];
+  return `${value.toLocaleString(locale(), { minimumFractionDigits: digits, maximumFractionDigits: digits })} ${units[unit]}`;
+}
+
 // localStorage kann fehlen oder werfen (privater Modus, gesperrte Website-Daten)
 const store = {
   get(key, fallback) {
@@ -230,13 +279,17 @@ const store = {
 
 let config = { engines: [], default_engine: null };
 let modelChoice = {};  // gewähltes Modell je Engine
-let selectedFile = null;
+// Ausgewählte Dateien: { file } aus dem Browser oder { opened: { id, name, size } } aus „Öffnen mit“ der Mac-App
+let selectedFiles = [];
+let availableUpdate = null;  // { latest, url } von GET /update
 const watchers = new Map();  // job_id -> laufende Verbindung
 
 const engineSelect = $('engine');
 const modelSelect = $('model');
 const languageSelect = $('language');
 const uiLanguageSelect = $('uiLanguage');
+const checkUpdatesInput = $('checkUpdates');
+const searchInput = $('historySearch');
 const outputFolderInput = $('outputFolder');
 const speakerNameInput = $('speakerName');
 const fileInput = $('fileInput');
@@ -265,14 +318,17 @@ function applyLanguage() {
     el.setAttribute('aria-label', el.title);
   }
   if (config.output_dir) $('dataHint').textContent = tr('transcriptsFolder', config.output_dir);
+  renderSelection();
+  showUpdate();
 }
 
 function applyConfig() {
   engineSelect.replaceChildren(...config.engines.map((e) => option(e.id, e.label)));
   $('engineField').hidden = config.engines.length < 2;
-  // Die App speichert immer in ihrem eigenen Ordner und kann ihre Daten komplett löschen
+  // Die App speichert immer in ihrem eigenen Ordner, kann ihre Daten komplett löschen und nach Updates suchen
   $('outputFolderField').hidden = !!config.app;
   $('resetBtn').hidden = !config.app;
+  $('checkUpdatesField').hidden = !config.app;
 }
 
 function fillModels() {
@@ -292,17 +348,20 @@ function loadSettings() {
   fillModels();
   languageSelect.value = SPOKEN_LANGUAGES.includes(s.language) ? s.language : lang;
   outputFolderInput.value = s.outputFolder || '';
+  checkUpdatesInput.checked = s.checkUpdates !== false;
   updateSummary();
 }
 
 function saveSettings() {
   modelChoice[engineSelect.value] = modelSelect.value;
   store.set(SETTINGS_KEY, {
+    ...store.get(SETTINGS_KEY, {}),  // z.B. die ausgeblendete Update-Version behalten
     engine: engineSelect.value,
     models: modelChoice,
     language: languageSelect.value,
     outputFolder: outputFolderInput.value.trim(),
     uiLanguage: uiLanguageSelect.value,
+    checkUpdates: checkUpdatesInput.checked,
   });
   updateSummary();
 }
@@ -348,6 +407,38 @@ uiLanguageSelect.addEventListener('change', () => {
   updateSummary();
   renderHistory();
 });
+checkUpdatesInput.addEventListener('change', () => {
+  saveSettings();
+  if (checkUpdatesInput.checked) checkForUpdate();
+  else $('update').hidden = true;
+});
+
+// ---------- Update-Hinweis (Mac-App) ----------
+
+// Fragt über den eigenen Server bei GitHub nach; die Seite selbst lädt nichts von fremden Servern
+async function checkForUpdate() {
+  if (!config.app || !checkUpdatesInput.checked) return;
+  try {
+    const response = await fetch('/update');
+    if (!response.ok) return;  // offline oder GitHub nicht erreichbar: kein Hinweis
+    const update = await response.json();
+    availableUpdate = update.newer && update.latest !== store.get(SETTINGS_KEY, {}).dismissedUpdate ? update : null;
+    showUpdate();
+  } catch {}
+}
+
+function showUpdate() {
+  $('update').hidden = !availableUpdate;
+  if (!availableUpdate) return;
+  $('updateText').textContent = tr('updateAvailable', availableUpdate.latest);
+  $('updateLink').href = availableUpdate.url;
+}
+
+$('updateDismiss').addEventListener('click', () => {
+  store.set(SETTINGS_KEY, { ...store.get(SETTINGS_KEY, {}), dismissedUpdate: availableUpdate?.latest });
+  availableUpdate = null;
+  showUpdate();
+});
 
 // ---------- Verlauf ----------
 
@@ -355,6 +446,7 @@ uiLanguageSelect.addEventListener('change', () => {
 let history = [];
 let historySignature = null;
 const HISTORY_REFRESH = 5000;  // ms; übernimmt Änderungen am Ordner, z.B. im Finder gelöschte .txt
+let editingId = null;  // Transkript, das gerade bearbeitet wird; solange baut die Liste nicht neu auf
 
 // Ohne Server zeigt die Seite nur noch den letzten Stand; das soll man sehen statt still nichts passiert
 function setOffline(offline) {
@@ -530,7 +622,7 @@ function playFrom(t, time) {
     if (player.audio.readyState >= 1) player.audio.currentTime = time;
     else player.audio.addEventListener('loadedmetadata', () => { player.audio.currentTime = time; }, { once: true });
   }
-  cardById(t.id)?.querySelector('.card-text').classList.remove('clamped');
+  cardById(t.id)?.querySelector('.card-text')?.classList.remove('clamped');
   player.audio.play().catch(() => {});
   updatePlayerUI();
 }
@@ -583,15 +675,17 @@ function createPlayer(t) {
 }
 
 function fillText(textEl, t) {
-  const segments = t.segments || [];
-  // Abschnitte nur nutzen, wenn sie zum Text passen (die .txt kann im Finder bearbeitet worden sein)
-  const start = segments.length ? (t.text || '').indexOf(segments[0][2]) : -1;
-  if (start < 0 || !t.audio) {
-    textEl.textContent = t.text || tr('noSpeech');
+  const text = t.text || '';
+  if (!text) {
+    textEl.textContent = tr('noSpeech');
     return;
   }
-  textEl.append(t.text.slice(0, start));  // Präfix mit Zeitstempel/Name
-  segments.forEach(([from, , words], index) => {
+  // Angezeigt wird immer die .txt. Die Abschnitte werden der Reihe nach darin gesucht: Wurde der
+  // Text bearbeitet (hier oder im Finder), bleibt Geändertes unmarkiert, der Rest bleibt anklickbar.
+  let pos = 0;
+  (t.audio ? t.segments || [] : []).forEach(([from, , words], index) => {
+    const at = words ? text.indexOf(words, pos) : -1;
+    if (at < 0) return;
     const span = Object.assign(document.createElement('span'), { className: 'seg', textContent: words });
     span.dataset.index = index;
     span.title = tr('playFromHere');
@@ -600,15 +694,91 @@ function fillText(textEl, t) {
       e.stopPropagation();
       playFrom(t, from);
     });
-    textEl.append(span, index < segments.length - 1 ? ' ' : '');
+    textEl.append(text.slice(pos, at), span);
+    pos = at + words.length;
   });
+  textEl.append(text.slice(pos));
 }
 
+function startEdit(card, t) {
+  editingId = t.id;
+  const area = Object.assign(document.createElement('textarea'), { className: 'card-edit', value: t.text || '' });
+  area.setAttribute('aria-label', tr('edit'));
+  const grow = () => {
+    area.style.height = 'auto';
+    area.style.height = `${area.scrollHeight + 2}px`;
+  };
+  const hint = Object.assign(document.createElement('div'), { className: 'hint', textContent: tr('editHint') });
+  const save = Object.assign(document.createElement('button'), { className: 'ghost-btn accent', type: 'button', textContent: tr('save') });
+  const cancel = Object.assign(document.createElement('button'), { className: 'ghost-btn', type: 'button', textContent: tr('cancel') });
+  const actions = document.createElement('div');
+  actions.className = 'card-actions';
+  actions.append(save, cancel);
+
+  const finish = () => {
+    editingId = null;
+    historySignature = null;  // auch ohne Änderung neu aufbauen, damit die Karte wieder normal aussieht
+    loadHistory();
+  };
+  const saveText = async () => {
+    save.disabled = true;
+    try {
+      const response = await fetch(`/transcripts?id=${encodeURIComponent(t.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: area.value }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      finish();
+    } catch (err) {
+      save.disabled = false;
+      createStatus().fail(tr('saveFailed'), err instanceof TypeError ? tr('noConnection') : err.message);
+    }
+  };
+  save.addEventListener('click', saveText);
+  cancel.addEventListener('click', finish);
+  area.addEventListener('input', grow);
+  area.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();  // nicht zusätzlich die Einstellungen schließen
+      finish();
+    } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      saveText();
+    }
+  });
+
+  card.querySelector('.card-text').replaceWith(area);
+  card.querySelector('.card-actions').replaceWith(hint, actions);
+  grow();
+  area.focus();
+}
+
+// Suche im Verlauf: Text und Dateiname, ohne Groß-/Kleinschreibung
+const matches = (t, query) => !query || `${t.text || ''}\n${t.file_name || ''}`.toLocaleLowerCase().includes(query);
+
+searchInput.addEventListener('input', () => renderHistory());
+searchInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && searchInput.value) {
+    e.stopPropagation();
+    searchInput.value = '';
+    renderHistory();
+  }
+});
+
 function renderHistory(freshId) {
-  const list = history;
-  if (player.id && !list.some((t) => t.id === player.id)) stopPlayer();  // abspielendes Transkript gelöscht
-  $('emptyState').hidden = list.length > 0;
-  $('historyCount').textContent = list.length ? tr('savedCount', list.length) : '';
+  // Beim Bearbeiten nicht neu aufbauen, sonst wäre der Text weg; danach lädt startEdit neu
+  if (editingId && history.some((t) => t.id === editingId)) return;
+  editingId = null;
+  const all = history;
+  if (player.id && !all.some((t) => t.id === player.id)) stopPlayer();  // abspielendes Transkript gelöscht
+  if (freshId) searchInput.value = '';  // ein neues Transkript soll man sehen
+  const query = searchInput.value.trim().toLocaleLowerCase();
+  const list = all.filter((t) => matches(t, query));
+  searchInput.hidden = all.length < 2 && !query;
+  $('emptyState').hidden = all.length > 0;
+  $('noResults').hidden = !all.length || list.length > 0;
+  $('historyCount').textContent = !all.length ? '' : query ? tr('searchCount', list.length, all.length) : tr('savedCount', all.length);
   $('historyList').replaceChildren(...list.map((t) => {
     const li = document.createElement('li');
     li.className = 'card' + (t.id === freshId ? ' fresh' : '');
@@ -644,13 +814,20 @@ function renderHistory(freshId) {
       className: 'ghost-btn copy', type: 'button', textContent: tr('copy'),
     });
     copy.addEventListener('click', () => copyText(t.text, copy));
+    const edit = Object.assign(document.createElement('button'), {
+      className: 'ghost-btn', type: 'button', textContent: tr('edit'),
+    });
+    edit.addEventListener('click', () => startEdit(li, t));
     const del = Object.assign(document.createElement('button'), {
       className: 'ghost-btn danger', type: 'button', textContent: tr('delete'),
     });
     del.addEventListener('click', () => {
       if (confirm(tr('confirmDelete'))) deleteTranscript(t.id);
     });
-    actions.append(copy, del);
+    const left = document.createElement('div');
+    left.className = 'card-actions-main';
+    left.append(copy, edit);
+    actions.append(left, del);
 
     li.append(meta);
     if (t.audio) li.append(createPlayer(t));
@@ -780,6 +957,16 @@ function createStatus() {
   };
 }
 
+// Mac-App im Hintergrund: Mitteilung von macOS, sobald eine Transkription fertig ist
+function notifyIfAway(title, body) {
+  if (!config.notify || document.hasFocus()) return;
+  fetch('/notify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, body }),
+  }).catch(() => {});
+}
+
 function watchJob(job) {
   const status = createStatus();
   const name = () => job.fileName || tr('voiceMessage');
@@ -818,8 +1005,10 @@ function watchJob(job) {
       }
 
       if (msg.type === 'progress') {
-        status.progress(msg.value);
-        if (msg.state === 'queued') status.detail(tr('queued'));
+        const download = msg.state === 'downloading' && msg.download?.total ? msg.download : null;
+        status.progress(download ? Math.min(100, (download.done / download.total) * 100) : msg.value);
+        if (download) status.detail(tr('downloadingProgress', formatBytes(download.done), formatBytes(download.total)));
+        else if (msg.state === 'queued') status.detail(msg.ahead ? tr('queuedAhead', msg.ahead) : tr('queued'));
         else if (msg.state === 'downloading') status.detail(tr('downloading'));
         else if (msg.value > 0) status.detail(tr('progress', msg.value));
         else status.detail(tr('loadingModel'));
@@ -830,11 +1019,13 @@ function watchJob(job) {
         fetch(`/job?job=${encodeURIComponent(job.id)}`, { method: 'DELETE' }).catch(() => {});
         status.el.remove();
         loadHistory(msg.id);
+        notifyIfAway(tr('notifyDone'), name());
       } else if (msg.type === 'error') {
         stop();
         removePending(job.id);
         status.fail(tr('error'), errorText(msg.error, msg.detail));
         if (msg.error === 'job_gone') loadHistory();  // z.B. in einem anderen Tab schon fertig geworden
+        else notifyIfAway(tr('notifyFailed'), name());
       }
     };
 
@@ -856,7 +1047,8 @@ function watchJob(job) {
 // ---------- Datei auswählen & hochladen ----------
 
 fileInput.addEventListener('change', (e) => {
-  if (e.target.files[0]) selectFile(e.target.files[0]);
+  addFiles([...e.target.files].map((file) => ({ file })));
+  fileInput.value = '';  // dieselbe Datei später noch einmal wählen können
 });
 
 // Dateien überall im Fenster annehmen: Daneben fallen gelassen würde der Browser bzw. das
@@ -887,55 +1079,73 @@ window.addEventListener('drop', (e) => {
   e.preventDefault();
   dragDepth = 0;
   dropZone.classList.remove('dragover');
-  if (e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]);
+  addFiles([...e.dataTransfer.files].map((file) => ({ file })));
 });
 
-function selectFile(file) {
-  selectedFile = file;
-  const mb = (file.size / 1024 / 1024).toLocaleString(locale(), { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-  const name = document.createElement('span');
-  name.textContent = `${file.name} (${mb} MB)`;
-  const remove = Object.assign(document.createElement('button'), {
-    type: 'button', className: 'file-remove', textContent: '✕', title: tr('removeSelection'),
-  });
-  remove.setAttribute('aria-label', tr('removeSelection'));
-  remove.addEventListener('click', (e) => {
-    e.stopPropagation();  // sonst öffnet sich die Dateiauswahl der Ablagefläche
-    clearSelection();
-  });
-  $('fileInfo').replaceChildren(name, remove);
-  startBtn.disabled = false;
-  // file.path is available in some local/Electron environments
-  if (file.path) {
-    const sep = file.path.includes('/') ? '/' : '\\';
-    outputFolderInput.value = file.path.substring(0, file.path.lastIndexOf(sep));
+const itemName = (item) => (item.file ? item.file.name : item.opened.name);
+const itemSize = (item) => (item.file ? item.file.size : item.opened.size);
+
+function addFiles(items) {
+  for (const item of items) {
+    const known = selectedFiles.some((s) => itemName(s) === itemName(item) && itemSize(s) === itemSize(item));
+    if (!known) selectedFiles.push(item);
   }
+  renderSelection();
 }
 
-function clearSelection() {
-  selectedFile = null;
-  fileInput.value = '';
-  $('fileInfo').replaceChildren();
-  startBtn.disabled = true;
+function renderSelection() {
+  $('fileInfo').replaceChildren(...selectedFiles.map((item) => {
+    const row = document.createElement('div');
+    row.className = 'file-row';
+    const name = document.createElement('span');
+    name.textContent = `${itemName(item)} (${formatBytes(itemSize(item))})`;
+    const remove = Object.assign(document.createElement('button'), {
+      type: 'button', className: 'file-remove', textContent: '✕', title: tr('removeFile', itemName(item)),
+    });
+    remove.setAttribute('aria-label', remove.title);
+    remove.addEventListener('click', (e) => {
+      e.stopPropagation();  // sonst öffnet sich die Dateiauswahl der Ablagefläche
+      selectedFiles = selectedFiles.filter((s) => s !== item);
+      renderSelection();
+    });
+    row.append(name, remove);
+    return row;
+  }));
+  startBtn.disabled = !selectedFiles.length;
+  startBtn.textContent = selectedFiles.length > 1 ? tr('startCount', selectedFiles.length) : tr('start');
 }
 
-startBtn.addEventListener('click', async () => {
-  if (!selectedFile) return;
+// Dateien, die die Mac-App per „Öffnen mit“ oder über das Dock bekommen hat
+async function loadOpened() {
+  if (!config.app) return;
+  try {
+    const response = await fetch('/opened');
+    if (response.ok) addFiles((await response.json()).map((opened) => ({ opened })));
+  } catch {}
+}
 
-  const file = selectedFile;
-  startBtn.disabled = true;
-  const upload = createStatus();
-  upload.busy(file.name);
-  upload.detail(tr('uploading'));
+window.addEventListener('transcribe:opened', loadOpened);  // ruft die Mac-App auf, sobald eine Datei kommt
+
+async function upload(item, speakerName) {
+  const status = createStatus();
+  status.busy(itemName(item));
+  // Vorher prüfen: Der Server lehnt zu große Dateien ab, bevor er sie liest, und der Browser
+  // meldet das beim Hochladen nur als abgebrochene Verbindung
+  if (config.max_upload && itemSize(item) > config.max_upload) {
+    status.fail(tr('error'), errorText('too_large', Math.floor(config.max_upload / 1024 ** 3)));
+    return;
+  }
+  status.detail(tr('uploading'));
   const controller = new AbortController();
-  upload.cancellable(() => controller.abort());
+  status.cancellable(() => controller.abort());
 
   const formData = new FormData();
-  formData.append('file', file);
+  if (item.file) formData.append('file', item.file);
+  else formData.append('opened', item.opened.id);
   formData.append('engine', engineSelect.value);
   formData.append('model', modelSelect.value);
   formData.append('language', languageSelect.value);
-  formData.append('speaker_name', speakerNameInput.value.trim());
+  formData.append('speaker_name', speakerName);
   formData.append('output_folder', outputFolderInput.value.trim());
 
   try {
@@ -946,21 +1156,32 @@ startBtn.addEventListener('click', async () => {
     });
     const data = await response.json();
     if (data.error) {
-      upload.fail(tr('error'), errorText(data.error, data.detail));
-      startBtn.disabled = false;
+      status.fail(tr('error'), errorText(data.error, data.detail));
+      if (data.error !== 'opened_gone') addFiles([item]);  // zum erneuten Versuch wieder auswählen
       return;
     }
-    upload.el.remove();
-    const job = { id: data.job_id, fileName: file.name, startedAt: Date.now() };
+    status.el.remove();
+    const job = { id: data.job_id, fileName: itemName(item), startedAt: Date.now() };
     addPending(job);
     watchJob(job);
-    clearSelection();
-    speakerNameInput.value = '';
   } catch (err) {
-    if (err.name === 'AbortError') upload.el.remove();
-    else upload.fail(tr('connectionError'), err.message);
-    startBtn.disabled = false;
+    if (err.name === 'AbortError') {
+      status.el.remove();
+    } else {
+      status.fail(tr('connectionError'), err.message);
+      addFiles([item]);
+    }
   }
+}
+
+startBtn.addEventListener('click', async () => {
+  const items = selectedFiles;
+  const speakerName = speakerNameInput.value.trim();
+  selectedFiles = [];
+  renderSelection();
+  speakerNameInput.value = '';
+  // Nacheinander hochladen: Der Server transkribiert in genau dieser Reihenfolge
+  for (const item of items) await upload(item, speakerName);
 });
 
 // ---------- Start ----------
@@ -974,6 +1195,8 @@ async function init() {
   if (config.version) $('version').textContent = `Transcribe ${config.version}`;
   loadSettings();
   loadHistory();
+  loadOpened();
+  checkForUpdate();
 
   resumePending();
 
@@ -992,9 +1215,14 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // Ein Wechsel zum Finder und zurück macht das Fenster nicht unsichtbar, daher auch bei Fokus und regelmäßig
-window.addEventListener('focus', () => loadHistory());
+window.addEventListener('focus', () => {
+  loadHistory();
+  loadOpened();
+});
 setInterval(() => {
-  if (document.visibilityState === 'visible') loadHistory();
+  if (document.visibilityState !== 'visible') return;
+  loadHistory();
+  loadOpened();
 }, HISTORY_REFRESH);
 
 // Schon vor der Antwort des Servers in der gespeicherten Sprache bzw. der des Browsers anzeigen
