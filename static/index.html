@@ -53,13 +53,23 @@
       <input type="text" id="outputFolder" placeholder="Path to the target folder (empty = transcriptions/)" data-i18n-placeholder="outputFolderPlaceholder">
     </div>
     <h2 class="panel-heading" data-i18n="settingsApp">App</h2>
-    <div class="field">
-      <label for="uiLanguage" data-i18n="appLanguage">App language</label>
-      <select id="uiLanguage">
-        <option value="auto" data-i18n="appLanguage_auto">Automatic (system)</option>
-        <option value="de">Deutsch</option>
-        <option value="en">English</option>
-      </select>
+    <div class="row">
+      <div class="field">
+        <label for="uiLanguage" data-i18n="appLanguage">App language</label>
+        <select id="uiLanguage">
+          <option value="auto" data-i18n="appLanguage_auto">Automatic (system)</option>
+          <option value="de">Deutsch</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="theme" data-i18n="appearance">Appearance</label>
+        <select id="theme">
+          <option value="auto" data-i18n="appLanguage_auto">Automatic (system)</option>
+          <option value="light" data-i18n="theme_light">Light</option>
+          <option value="dark" data-i18n="theme_dark">Dark</option>
+        </select>
+      </div>
     </div>
     <label class="check" id="checkUpdatesField" hidden>
       <input type="checkbox" id="checkUpdates" checked>

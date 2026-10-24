@@ -27,6 +27,9 @@ const TEXTS = {
     outputFolderPlaceholder: 'Pfad zum Zielordner (leer = transcriptions/)',
     appLanguage: 'Sprache der App',
     appLanguage_auto: 'Automatisch (System)',
+    appearance: 'Erscheinungsbild',
+    theme_light: 'Hell',
+    theme_dark: 'Dunkel',
     openFolder: 'Ordner öffnen',
     resetData: 'Alle App-Daten löschen …',
     dropTitle: 'Audiodatei hierher ziehen',
@@ -137,6 +140,9 @@ const TEXTS = {
     outputFolderPlaceholder: 'Path to the target folder (empty = transcriptions/)',
     appLanguage: 'App language',
     appLanguage_auto: 'Automatic (system)',
+    appearance: 'Appearance',
+    theme_light: 'Light',
+    theme_dark: 'Dark',
     openFolder: 'Open folder',
     resetData: 'Delete all app data …',
     dropTitle: 'Drop an audio file here',
@@ -288,6 +294,7 @@ const engineSelect = $('engine');
 const modelSelect = $('model');
 const languageSelect = $('language');
 const uiLanguageSelect = $('uiLanguage');
+const themeSelect = $('theme');
 const checkUpdatesInput = $('checkUpdates');
 const searchInput = $('historySearch');
 const outputFolderInput = $('outputFolder');
@@ -322,6 +329,16 @@ function applyLanguage() {
   showUpdate();
 }
 
+// Hell oder dunkel: gewählt oder wie das System, auch wenn es während des Betriebs umschaltet
+const systemDark = matchMedia('(prefers-color-scheme: dark)');
+
+function applyTheme() {
+  const choice = themeSelect.value;
+  document.documentElement.dataset.theme = choice === 'light' || choice === 'dark' ? choice : systemDark.matches ? 'dark' : 'light';
+}
+
+systemDark.addEventListener('change', applyTheme);
+
 function applyConfig() {
   engineSelect.replaceChildren(...config.engines.map((e) => option(e.id, e.label)));
   $('engineField').hidden = config.engines.length < 2;
@@ -343,6 +360,8 @@ function loadSettings() {
   const s = store.get(SETTINGS_KEY, {});
   uiLanguageSelect.value = s.uiLanguage === 'de' || s.uiLanguage === 'en' ? s.uiLanguage : 'auto';
   applyLanguage();
+  themeSelect.value = s.theme === 'light' || s.theme === 'dark' ? s.theme : 'auto';
+  applyTheme();
   modelChoice = s.models || {};
   engineSelect.value = config.engines.some((e) => e.id === s.engine) ? s.engine : config.default_engine;
   fillModels();
@@ -361,6 +380,7 @@ function saveSettings() {
     language: languageSelect.value,
     outputFolder: outputFolderInput.value.trim(),
     uiLanguage: uiLanguageSelect.value,
+    theme: themeSelect.value,
     checkUpdates: checkUpdatesInput.checked,
   });
   updateSummary();
@@ -406,6 +426,10 @@ uiLanguageSelect.addEventListener('change', () => {
   fillModels();
   updateSummary();
   renderHistory();
+});
+themeSelect.addEventListener('change', () => {
+  saveSettings();
+  applyTheme();
 });
 checkUpdatesInput.addEventListener('change', () => {
   saveSettings();
@@ -1225,7 +1249,9 @@ setInterval(() => {
   loadOpened();
 }, HISTORY_REFRESH);
 
-// Schon vor der Antwort des Servers in der gespeicherten Sprache bzw. der des Browsers anzeigen
+// Schon vor der Antwort des Servers in der gespeicherten Sprache und Farbe anzeigen
 uiLanguageSelect.value = store.get(SETTINGS_KEY, {}).uiLanguage || 'auto';
+themeSelect.value = store.get(SETTINGS_KEY, {}).theme || 'auto';
 applyLanguage();
+applyTheme();
 init();

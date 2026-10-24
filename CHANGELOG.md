@@ -9,7 +9,7 @@ Changes to Transcribe, newest first. Each version matches a release tag `vX.Y.Z`
 - The first download of a model shows its progress in MB.
 - Search the history by text or file name.
 - Edit a transcription in its card; the change is saved to the `.txt` file.
-- Light design that follows the system setting.
+- Light design. It follows the system setting, or choose light or dark in the settings (⚙︎) under **Appearance**.
 - Mac app: open audio files with **Open With → Transcribe** in Finder or by dropping them on the Dock icon. Transcribe never becomes the default app for audio.
 - Mac app: a notification when a transcription finishes while the app is in the background (macOS asks for permission once).
 - Mac app: a hint when a new version is available. Transcribe asks GitHub once at startup; turn it off in the settings.

@@ -17,7 +17,7 @@ There are two ways to use it:
 - Optional speaker name and a timestamp taken from the file name (WhatsApp format) at the start of the text
 - History of all transcriptions with search, copy, edit, and delete; each one is saved as a `.txt` file
 - Playback of the original recording with the sentence being spoken highlighted; click a sentence to jump there
-- Interface in English and German, light or dark following your system
+- Interface in English and German, light or dark (automatic or set in the settings)
 - Mac app: open audio files with **Open With** or by dropping them on the Dock icon, a notification when a transcription is done, and a hint when a new version is out
 - GPU acceleration where available (Apple Silicon via MLX or MPS, NVIDIA via CUDA), otherwise the CPU
 
@@ -101,7 +101,7 @@ To correct a transcription, click **Edit** on its card, change the text, and cli
 
 To listen to a transcription, click ▶ on its card. The sentence being spoken is highlighted; click any sentence or the progress bar to jump there. Transcriptions made before version 1.1.0 have no playback, because their audio was not kept.
 
-**Language and appearance:** the interface, the terminal, and the log follow your system language: German on a German system, English otherwise. You can switch the interface under **App language** in the settings. Light or dark follows your system setting.
+**Language and appearance:** the interface, the terminal, and the log follow your system language: German on a German system, English otherwise. You can switch the interface under **App language** in the settings. Light or dark follows your system setting unless you choose one under **Appearance**.
 
 ## Where your data is stored
 

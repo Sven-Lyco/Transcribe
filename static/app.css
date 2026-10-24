@@ -17,24 +17,22 @@
   color-scheme: dark;
 }
 
-/* Hell, wenn das System hell eingestellt ist. Das Gelb wäre auf Weiß unlesbar, daher Oliv als
-   Akzent (6:1 auf Weiß) und Gelb nur noch als Textmarker für den gesprochenen Satz. */
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f5f5f2;
-    --surface: #ffffff;
-    --surface-hover: #f0f0eb;
-    --border: #d9d9d2;
-    --accent: #586800;
-    --on-accent: #ffffff;
-    --accent-soft: rgba(88, 104, 0, 0.08);
-    --highlight-bg: #ecff7a;
-    --highlight-text: #1a1a1a;
-    --text: #1a1a1a;
-    --muted: #63635c;
-    --danger: #c0392b;
-    color-scheme: light;
-  }
+/* Hell: gewählt oder vom System (app.js setzt data-theme, applyTheme). Das Gelb wäre auf Weiß
+   unlesbar, daher Oliv als Akzent (6:1 auf Weiß) und Gelb nur als Textmarker für den gesprochenen Satz. */
+:root[data-theme="light"] {
+  --bg: #f5f5f2;
+  --surface: #ffffff;
+  --surface-hover: #f0f0eb;
+  --border: #d9d9d2;
+  --accent: #586800;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(88, 104, 0, 0.08);
+  --highlight-bg: #ecff7a;
+  --highlight-text: #1a1a1a;
+  --text: #1a1a1a;
+  --muted: #63635c;
+  --danger: #c0392b;
+  color-scheme: light;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
