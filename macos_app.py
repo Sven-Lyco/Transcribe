@@ -9,6 +9,7 @@ packaging/macos/build.sh.
 import os
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 # Alle Daten der App liegen in einem Ordner: Transkripte, Verlauf, Modelle, Caches und Log.
@@ -47,6 +48,74 @@ def keep_full_speed():
     )
 
 
+def system_is_dark():
+    from Foundation import NSUserDefaults
+    return NSUserDefaults.standardUserDefaults().stringForKey_("AppleInterfaceStyle") == "Dark"
+
+
+def accept_opened_files(transcribe, window):
+    """Gibt Dateien aus „Öffnen mit“ und vom Dock-Symbol an den Server weiter.
+
+    pywebview bietet dafür nichts an; sein App-Delegate bekommt deshalb eine Unterklasse, die
+    macOS' application:openURLs: annimmt. Sie muss vor webview.start() eingesetzt sein, weil
+    pywebview den Delegate beim Anlegen des Fensters erzeugt.
+    """
+    from webview.platforms.cocoa import BrowserView
+
+    def tell_page():
+        try:
+            window.run_js("window.dispatchEvent(new Event('transcribe:opened'))")
+        except Exception:
+            pass  # Seite noch nicht geladen: Sie holt die Dateien beim Start selbst ab
+
+    class TranscribeAppDelegate(BrowserView.AppDelegate):
+        def application_openURLs_(self, app, urls):
+            transcribe.register_opened_files([url.path() for url in urls if url.isFileURL()])
+            # run_js wartet auf den Haupt-Thread, auf dem dieser Aufruf gerade läuft
+            threading.Thread(target=tell_page, daemon=True).start()
+
+    BrowserView.AppDelegate = TranscribeAppDelegate
+
+
+def make_notifier(transcribe):
+    """Mitteilung von macOS für fertige Transkriptionen; dazu hüpft das Dock-Symbol einmal.
+
+    Die Erlaubnis fragt macOS bei der ersten Mitteilung ab. Ohne sie bleibt das Hüpfen, das keine braucht.
+    """
+    import AppKit
+    from PyObjCTools import AppHelper
+
+    try:
+        import UserNotifications as UN
+        center = UN.UNUserNotificationCenter.currentNotificationCenter()
+    except Exception as e:  # z.B. außerhalb eines App-Bundles
+        print("  " + transcribe.tr("notify_failed", error=e))
+        center = None
+
+    def notify(title, body):
+        AppHelper.callAfter(AppKit.NSApp.requestUserAttention_, AppKit.NSInformationalRequest)
+        if center is None:
+            return
+
+        def post(granted, error):
+            if not granted:
+                if error:
+                    print("  " + transcribe.tr("notify_failed", error=error))
+                return
+            content = UN.UNMutableNotificationContent.alloc().init()
+            content.setTitle_(title)
+            content.setBody_(body)
+            content.setSound_(UN.UNNotificationSound.defaultSound())
+            request = UN.UNNotificationRequest.requestWithIdentifier_content_trigger_(str(uuid.uuid4()), content, None)
+            center.addNotificationRequest_withCompletionHandler_(request, None)
+
+        center.requestAuthorizationWithOptions_completionHandler_(
+            UN.UNAuthorizationOptionAlert | UN.UNAuthorizationOptionSound, post,
+        )
+
+    return notify
+
+
 def main():
     redirect_output()
     activity = keep_full_speed()  # Referenz halten, solange die App läuft
@@ -62,10 +131,14 @@ def main():
     print(f"Transcribe {transcribe.VERSION}: " + transcribe.tr("running_on", url=url))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     threading.Thread(target=transcribe._prune_jobs_forever, daemon=True).start()
+    transcribe.notify_hook = make_notifier(transcribe)
 
-    webview.create_window(
-        "Transcribe", url, width=760, height=900, min_size=(520, 600), background_color="#0f0f0f",
+    # Hintergrund wie die Seite (static/app.css), damit beim Öffnen nichts aufblitzt
+    window = webview.create_window(
+        "Transcribe", url, width=760, height=900, min_size=(520, 600),
+        background_color="#0f0f0f" if system_is_dark() else "#f5f5f2",
     )
+    accept_opened_files(transcribe, window)
     # private_mode=False, sonst löscht pywebview den localStorage (Einstellungen) bei jedem Start
     webview.start(private_mode=False)
 

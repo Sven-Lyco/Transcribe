@@ -66,5 +66,14 @@ app = BUNDLE(
         "NSAppSleepDisabled": True,
         # Die Oberfläche kommt vom lokalen Server unter http://127.0.0.1
         "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
+        # Audiodateien per „Öffnen mit“ und über das Dock-Symbol (macos_app.accept_opened_files).
+        # Alternate: Transcribe wird nie von selbst die Standard-App für Audio. .ogg/.oga/.opus
+        # führt macOS als org.xiph.ogg-audio, das zu public.audio gehört.
+        "CFBundleDocumentTypes": [{
+            "CFBundleTypeName": "Audio",
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate",
+            "LSItemContentTypes": ["public.audio", "org.xiph.ogg-audio", "org.xiph.opus"],
+        }],
     },
 )
