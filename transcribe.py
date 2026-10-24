@@ -967,6 +967,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "version": VERSION,
                 "app": APP_DATA_DIR is not None,
                 "notify": notify_hook is not None,
+                "max_upload": MAX_UPLOAD,
                 "output_dir": str(DEFAULT_OUTPUT_DIR).replace(str(Path.home()), "~", 1),
             })
             return
@@ -1098,6 +1099,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         if parsed.path != "/transcripts":
+            self._discard_body()
             self.send_error(404)
             return
         data = self._read_json(MAX_TEXT)
@@ -1140,6 +1142,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if self.path != "/transcribe":
+            self._discard_body()
             self.send_response(404)
             self.end_headers()
             return
@@ -1297,6 +1300,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass  # der Browser bricht Ausschnitte oft ab, sobald er genug hat
+
+    def _discard_body(self, limit=MAX_NOTIFY):
+        """Liest einen kleinen, nicht gebrauchten Body, bevor ohne ihn geantwortet wird.
+
+        Bleiben Daten ungelesen im Socket, setzt das System die Verbindung beim Schließen zurück,
+        und der Browser sieht statt der Antwort einen Verbindungsfehler.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return
+        if 0 < length <= limit:
+            self.rfile.read(length)
 
     def _read_json(self, limit):
         """Liest einen JSON-Objekt-Body bis `limit` Bytes. Bei Fehlern antwortet es selbst und gibt None zurück."""
