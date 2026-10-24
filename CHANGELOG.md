@@ -2,6 +2,21 @@
 
 Changes to Transcribe, newest first. Each version matches a release tag `vX.Y.Z`; the release workflow copies the section of the tagged version into the GitHub release notes.
 
+## [Unreleased]
+
+### New
+- Choose or drop several files at once. They are transcribed one after another in the order shown, and each waiting file shows how many are ahead of it.
+- The first download of a model shows its progress in MB.
+- Search the history by text or file name.
+- Edit a transcription in its card; the change is saved to the `.txt` file.
+- Light design that follows the system setting.
+- Mac app: open audio files with **Open With → Transcribe** in Finder or by dropping them on the Dock icon. Transcribe never becomes the default app for audio.
+- Mac app: a notification when a transcription finishes while the app is in the background (macOS asks for permission once).
+- Mac app: a hint when a new version is available. Transcribe asks GitHub once at startup; turn it off in the settings.
+
+### Fixed
+- After a `.txt` file was changed outside Transcribe, its card showed the old text; it now always shows the file's content.
+
 ## [1.2.0] – 2026-10-24
 
 ### New

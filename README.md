@@ -11,13 +11,14 @@ There are two ways to use it:
 
 ## Features
 
-- Drag and drop common audio formats: OGG/Opus (WhatsApp), MP3, M4A/AAC, WAV, FLAC, AIFF, WebM
-- Progress bar while transcribing, with a button to cancel
+- Drag and drop common audio formats: OGG/Opus (WhatsApp), MP3, M4A/AAC, WAV, FLAC, AIFF, WebM; several files at once are transcribed one after another
+- Progress bar while transcribing and while the model downloads, with a button to cancel
 - Spoken language German, English, or detected automatically
 - Optional speaker name and a timestamp taken from the file name (WhatsApp format) at the start of the text
-- History of all transcriptions with copy and delete; each one is saved as a `.txt` file
+- History of all transcriptions with search, copy, edit, and delete; each one is saved as a `.txt` file
 - Playback of the original recording with the sentence being spoken highlighted; click a sentence to jump there
-- Interface in English and German
+- Interface in English and German, light or dark following your system
+- Mac app: open audio files with **Open With** or by dropping them on the Dock icon, a notification when a transcription is done, and a hint when a new version is out
 - GPU acceleration where available (Apple Silicon via MLX or MPS, NVIDIA via CUDA), otherwise the CPU
 
 ## Mac app
@@ -30,6 +31,10 @@ For **Apple Silicon (M1 or newer) with macOS 14 Sonoma or later**. No Python, Te
 4. Drop an audio file into the window and click **Start**.
 
 The first transcription downloads the Whisper model (about 1.5 GB). On Intel Macs, use the [script](#script-macos-windows-linux).
+
+You can also right-click an audio file in Finder and choose **Open With → Transcribe**, or drop it on Transcribe's Dock icon; the file is then selected in the window. Transcribe never makes itself the default app for audio files.
+
+When a transcription finishes while Transcribe is in the background, it shows a notification. macOS asks for permission the first time; you can change it later in **System Settings → Notifications → Transcribe**.
 
 ### Uninstalling the app
 
@@ -83,18 +88,20 @@ python transcribe.py
 
 ## Using Transcribe
 
-1. Drop an audio file anywhere onto the window, or click the drop area to choose one.
+1. Drop one or more audio files anywhere onto the window, or click the drop area to choose them. ✕ removes a file from the selection.
 2. Optional: open the settings (⚙︎, or **change** below the start button) to pick the engine, the **Model**, the **Spoken language**, and, in the script, an **Output folder**. These settings are remembered, including the model for each engine.
 3. Optional: enter a name under **Who is speaking?**. It is put in front of the text.
-4. Click **Start**.
+4. Click **Start**. Several files are transcribed one after another in the order shown; each waiting file shows how many are ahead of it.
 
 To stop a transcription, click **Cancel** below its progress bar. Whisper works through the audio in sections of about 30 seconds, so a running transcription stops at the end of the current section.
 
-The result appears in the **History** and is saved as a `.txt` file named after the audio file. An existing `.txt` with the same name is overwritten. Deleting an entry in the history also deletes its `.txt` file, and a file you delete in Finder or Explorer disappears from the history.
+The result appears in the **History** and is saved as a `.txt` file named after the audio file. An existing `.txt` with the same name is overwritten. Deleting an entry in the history also deletes its `.txt` file, and a file you delete in Finder or Explorer disappears from the history. The search field above the history filters by text and file name.
+
+To correct a transcription, click **Edit** on its card, change the text, and click **Save** (or press Cmd/Ctrl+Enter; Esc cancels). The change is saved to the `.txt` file. Sentences you changed are no longer highlighted during playback; the others still are.
 
 To listen to a transcription, click ▶ on its card. The sentence being spoken is highlighted; click any sentence or the progress bar to jump there. Transcriptions made before version 1.1.0 have no playback, because their audio was not kept.
 
-**Language:** the interface, the terminal, and the log follow your system language: German on a German system, English otherwise. You can switch the interface under **App language** in the settings.
+**Language and appearance:** the interface, the terminal, and the log follow your system language: German on a German system, English otherwise. You can switch the interface under **App language** in the settings. Light or dark follows your system setting.
 
 ## Where your data is stored
 
@@ -121,6 +128,7 @@ Versions up to 1.1.0 used German names (`Transkripte/`, `.verlauf.json`). They a
 - The interface is served on `127.0.0.1` only, so other devices on your network cannot reach it. Requests coming from other websites are rejected. Like any local server without a login, it can be reached by other user accounts on the same computer.
 - The page loads no external resources: no fonts, scripts, or analytics.
 - An internet connection is needed only to install the dependencies (script) and to download each Whisper model the first time you use it.
+- The Mac app asks GitHub once at startup whether a newer version exists (`api.github.com`). Nothing about your recordings is sent. Turn it off in the settings under **Check for updates at startup**.
 
 ## Engines and models
 
