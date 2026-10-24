@@ -20,6 +20,7 @@ import http.server
 import importlib
 import socketserver
 import json
+import locale
 import os
 import re
 import shutil
@@ -78,6 +79,7 @@ LANGUAGES = ("de", "en", "auto")
 JOB_TTL = 15 * 60  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Speicher bleibt
 SOCKET_TIMEOUT = 60  # Sekunden ohne Datenfluss, bevor eine Verbindung aufgegeben wird
 MAX_FILE_NAME = 200
+MAX_UPLOAD = 2 * 1024 ** 3  # Bytes; der Upload wird komplett im Speicher gelesen (gut 3 Stunden WAV)
 
 # In der Mac-App (PyInstaller) liegen die Dateien unter sys._MEIPASS
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -85,9 +87,12 @@ STATIC_DIR = BASE_DIR / "static"
 # Die Mac-App legt alle ihre Daten in einen eigenen Ordner (TRANSCRIBE_DATA_DIR), damit
 # „Alle App-Daten löschen“ sie gesammelt entfernen kann. Das Skript speichert im Projektordner.
 APP_DATA_DIR = Path(os.environ["TRANSCRIBE_DATA_DIR"]) if os.environ.get("TRANSCRIBE_DATA_DIR") else None
-DEFAULT_OUTPUT_DIR = APP_DATA_DIR / "Transkripte" if APP_DATA_DIR else Path(__file__).parent / "transcriptions"
+DEFAULT_OUTPUT_DIR = APP_DATA_DIR / "Transcripts" if APP_DATA_DIR else Path(__file__).parent / "transcriptions"
 # Merkt sich zu jedem Transkript Datum, Dauer und Originaldatei für den Verlauf
-HISTORY_INDEX = DEFAULT_OUTPUT_DIR / ".verlauf.json"
+HISTORY_INDEX = DEFAULT_OUTPUT_DIR / ".history.json"
+# Namen bis Version 1.1.0, migrate_legacy_names() übernimmt die Daten
+LEGACY_OUTPUT_DIR = APP_DATA_DIR / "Transkripte" if APP_DATA_DIR else None
+LEGACY_HISTORY_INDEX = DEFAULT_OUTPUT_DIR / ".verlauf.json"
 # Original-Audiodateien für den Player im Verlauf
 AUDIO_DIR = DEFAULT_OUTPUT_DIR / ".audio"
 AUDIO_TYPES = {
@@ -108,6 +113,89 @@ CSP = (
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
 
+
+def _language_of(value):
+    return "de" if value.lower().startswith(("de", "german")) else "en"
+
+
+def _system_language():
+    """'de' bei deutscher Systemsprache, sonst 'en'. Gilt fürs Terminal, das Log und als Voreinstellung der Seite."""
+    for name in ("TRANSCRIBE_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name, "")
+        if value and value not in ("C", "POSIX") and not value.startswith("C."):
+            return _language_of(value)
+    try:
+        if sys.platform == "darwin":
+            # Aus dem Finder gestartete Apps bekommen kein LANG
+            r = subprocess.run(["defaults", "read", "-g", "AppleLanguages"], capture_output=True, text=True, timeout=5)
+            match = re.search(r'\(\s*"?([A-Za-z]+)', r.stdout)
+            if match:
+                return _language_of(match.group(1))
+        elif sys.platform == "win32":
+            import ctypes
+            return _language_of(locale.windows_locale.get(ctypes.windll.kernel32.GetUserDefaultUILanguage(), ""))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _language_of(locale.getlocale()[0] or "")
+
+
+UI_LANGUAGE = _system_language()
+
+# Meldungen im Terminal bzw. im Log der Mac-App als (Deutsch, Englisch). Die Weboberfläche übersetzt
+# sich selbst (static/app.js); der Server schickt ihr nur Fehlercodes (Handler._json_error).
+MESSAGES = {
+    "ffmpeg_found": ("ffmpeg gefunden: {path}", "Found ffmpeg: {path}"),
+    "ffmpeg_missing": (
+        "Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.",
+        "Warning: ffmpeg was not found. Transcriptions will fail without it.",
+    ),
+    "ffmpeg_install": ("Installation:", "To install it:"),
+    "engine_broken": (
+        "{label} ist installiert, lässt sich aber nicht laden: {error}",
+        "{label} is installed but cannot be loaded: {error}",
+    ),
+    "whisper_missing": ("Whisper ist nicht installiert.", "Whisper is not installed."),
+    "run_once": ("Bitte einmalig ausführen:", "Run this once:"),
+    "mlx_faster": ("(Apple Silicon, deutlich schneller)", "(Apple Silicon, much faster)"),
+    "loading_model": ("→ Lade Modell '{model}'...", "→ Loading model '{model}'..."),
+    "downloading_model": ("→ Lade Modell {model} herunter...", "→ Downloading model {model}..."),
+    "transcribing": ("→ Transkribiere '{file}' mit {engine}/{model}...", "→ Transcribing '{file}' with {engine}/{model}..."),
+    "done": ("✓ Fertig! Gespeichert als: {path}", "✓ Done! Saved as: {path}"),
+    "cancelled": ("⏹ '{file}' abgebrochen", "⏹ '{file}' cancelled"),
+    "audio_not_kept": ("Audio konnte nicht aufbewahrt werden: {error}", "Could not keep the audio file: {error}"),
+    "compat_failed": ("Umwandeln zum Abspielen fehlgeschlagen: {error}", "Converting the audio for playback failed: {error}"),
+    "reset_refused": (
+        "App-Daten nicht gelöscht: {folder} ist kein eigener Ordner der App",
+        "App data not deleted: {folder} is not the app's own folder",
+    ),
+    "reset_done": ("Alle App-Daten gelöscht", "All app data deleted"),
+    "migrated": ("Daten früherer Versionen übernommen: {path}", "Moved data of an earlier version: {path}"),
+    "migration_failed": ("Daten früherer Versionen nicht übernommen: {error}", "Could not move data of an earlier version: {error}"),
+    "not_a_number": ("'{value}' ist keine Zahl", "'{value}' is not a number"),
+    "port_range": ("Port muss zwischen 1 und 65535 liegen", "The port must be between 1 and 65535"),
+    "port_blocked": ("Port {port} wird von Browsern blockiert", "Browsers block port {port}"),
+    "free_ports": ("Freie Ports:", "Free ports:"),
+    "choose_port": ("Auswahl oder eigener Port (Enter = {port}): ", "Pick one or type a port (Enter = {port}): "),
+    "enter_port": ("Anderen Port eingeben: ", "Enter another port: "),
+    "invalid_input": ("Ungültige Eingabe: {error}", "Invalid input: {error}"),
+    "server_failed": ("Server konnte nicht gestartet werden: {error}", "Could not start the server: {error}"),
+    "port_unavailable": ("Port {port} ist nicht verfügbar ({reason}).", "Port {port} is not available ({reason})."),
+    "no_free_port": ("Kein freier Port gefunden.", "No free port found."),
+    "use_port_option": ("Mit --port einen anderen Port angeben.", "Use --port to choose another port."),
+    "description": ("Lokales Whisper-Transkriptions-Tool", "Local Whisper transcription tool"),
+    "help_port": ("Port für die Weboberfläche (Standard: {port})", "Port for the web UI (default: {port})"),
+    "help_no_browser": ("Browser beim Start nicht öffnen", "Do not open the browser at startup"),
+    "running_on": ("Server läuft auf {url}", "Server running at {url}"),
+    "opening_browser": ("Browser öffnet sich automatisch...", "Opening the browser..."),
+    "stop_with": ("Zum Beenden: {key}", "To stop: {key}"),
+    "stopped": ("Server gestoppt.", "Server stopped."),
+}
+
+
+def tr(key, **values):
+    """Meldung fürs Terminal bzw. Log in der Systemsprache."""
+    return MESSAGES[key][0 if UI_LANGUAGE == "de" else 1].format(**values)
+
 # ffmpeg automatisch finden (PATH, Windows WinGet + macOS Homebrew)
 def find_and_add_ffmpeg():
     if shutil.which("ffmpeg"):
@@ -121,7 +209,7 @@ def find_and_add_ffmpeg():
         for path in candidates:
             if Path(path, "ffmpeg").exists():
                 os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
-                print(f"  ffmpeg gefunden: {path}")
+                print("  " + tr("ffmpeg_found", path=path))
                 return True
         return False
 
@@ -140,7 +228,7 @@ def find_and_add_ffmpeg():
         for match in matches:
             if Path(match).exists():
                 os.environ["PATH"] = match + os.pathsep + os.environ.get("PATH", "")
-                print(f"  ffmpeg gefunden: {match}")
+                print("  " + tr("ffmpeg_found", path=match))
                 return True
     return False
 
@@ -189,17 +277,17 @@ def load_engines():
             _engines[name] = importlib.import_module(engine["module"])
         except ImportError as e:
             if e.name != engine["module"]:  # installiert, aber eine Abhängigkeit fehlt
-                print(f"  {engine['label']} ist installiert, lässt sich aber nicht laden: {e}")
+                print("  " + tr("engine_broken", label=engine["label"], error=e))
         except Exception as e:
-            print(f"  {engine['label']} ist installiert, lässt sich aber nicht laden: {e}")
+            print("  " + tr("engine_broken", label=engine["label"], error=e))
 
     if not _engines:
         print("=" * 50)
-        print("Whisper ist nicht installiert.")
-        print("Bitte einmalig ausführen:")
+        print(tr("whisper_missing"))
+        print(tr("run_once"))
         print("    pip install openai-whisper")
         if sys.platform == "darwin" and os.uname().machine == "arm64":
-            print("    pip install mlx-whisper   (Apple Silicon, deutlich schneller)")
+            print("    pip install mlx-whisper   " + tr("mlx_faster"))
         print("=" * 50)
         sys.exit(1)
 
@@ -242,7 +330,7 @@ def _load_openai_model(model_name):
     else:
         device = "cpu"
 
-    print(f"  → Lade Modell '{model_name}'...")
+    print("  " + tr("loading_model", model=model_name))
     # Auf CPU laden und alignment_heads (sparse Tensor) für den Umzug in dense umwandeln,
     # da MPS keine sparse Tensoren unterstützt (siehe pytorch/pytorch#78168).
     model = _engines["openai"].load_model(model_name, device="cpu")
@@ -275,7 +363,7 @@ def _ensure_mlx_model(job_id, repo):
     with _jobs_lock:
         _raise_if_cancelled(job_id)
         _jobs[job_id]["state"] = "downloading"
-    print(f"  → Lade Modell {repo} herunter...")
+    print("  " + tr("downloading_model", model=repo))
     snapshot_download(repo)
     with _jobs_lock:
         _raise_if_cancelled(job_id)
@@ -308,7 +396,7 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
             with _jobs_lock:
                 _raise_if_cancelled(job_id)  # schon abgebrochen, während der Job wartete
                 _jobs[job_id]["state"] = "running"
-            print(f"  → Transkribiere '{file_name}' mit {engine}/{model_name}...")
+            print("  " + tr("transcribing", file=file_name, engine=engine, model=model_name))
             # verbose=False zeigt den tqdm-Fortschritt, über den Fortschritt und Abbruch laufen
             # word_timestamps: genaue Zeiten für die Hervorhebung beim Abspielen (dauert etwa doppelt so lang)
             kwargs = {"verbose": False, "word_timestamps": True}
@@ -349,7 +437,7 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
         segments = _passages(result)
         audio = _keep_original_audio(tmp_path, transcript_id)
         _add_to_history(transcript_id, txt_path, file_name, lang, duration, segments, audio)
-        print(f"  ✓ Fertig! Gespeichert als: {txt_path}")
+        print("  " + tr("done", path=txt_path))
 
         with _jobs_lock:
             if job_id in _jobs:
@@ -366,16 +454,16 @@ def _run_transcription(job_id, engine, model_name, tmp_path, language, speaker_n
                     },
                 })
     except JobCancelled:
-        print(f"  ⏹ '{file_name}' abgebrochen")
+        print("  " + tr("cancelled", file=file_name))
     except Exception as e:
-        message = str(e)
-        if message.startswith("Failed to load audio"):
+        error, detail = "failed", str(e)
+        if detail.startswith("Failed to load audio"):
             # Beide Engines hängen die komplette ffmpeg-Ausgabe an, die gehört nur ins Log
-            print(f"  ✗ '{file_name}': {message}")
-            message = "Audio konnte nicht gelesen werden (beschädigt, unbekanntes Format oder keine Tonspur)."
+            print(f"  ✗ '{file_name}': {detail}")
+            error, detail = "unreadable_audio", None
         with _jobs_lock:
             if job_id in _jobs:
-                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": message})
+                _jobs[job_id].update({"done": True, "finished_at": time.time(), "error": error, "detail": detail})
     finally:
         os.unlink(tmp_path)
 
@@ -392,6 +480,28 @@ def _save_history_index(index):
     tmp = HISTORY_INDEX.with_suffix(".tmp")
     tmp.write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(HISTORY_INDEX)
+
+
+def migrate_legacy_names():
+    """Übernimmt die Daten von Version 1.1.0 und älter: Ordner „Transkripte“ und Verlauf „.verlauf.json“.
+
+    Vor dem Start des Servers aufrufen. Die Pfade im Verlauf zeigen danach in den neuen Ordner.
+    """
+    try:
+        if LEGACY_OUTPUT_DIR and LEGACY_OUTPUT_DIR.is_dir() and not DEFAULT_OUTPUT_DIR.exists():
+            LEGACY_OUTPUT_DIR.rename(DEFAULT_OUTPUT_DIR)
+            print("  " + tr("migrated", path=DEFAULT_OUTPUT_DIR))
+        if LEGACY_HISTORY_INDEX.is_file() and not HISTORY_INDEX.exists():
+            index = json.loads(LEGACY_HISTORY_INDEX.read_text(encoding="utf-8"))
+            for meta in index.values():
+                path = Path(meta.get("path", ""))
+                if LEGACY_OUTPUT_DIR and path.is_relative_to(LEGACY_OUTPUT_DIR):
+                    meta["path"] = str(DEFAULT_OUTPUT_DIR / path.relative_to(LEGACY_OUTPUT_DIR))
+            _save_history_index(index)
+            LEGACY_HISTORY_INDEX.unlink()
+            print("  " + tr("migrated", path=HISTORY_INDEX))
+    except (OSError, ValueError) as e:
+        print("  " + tr("migration_failed", error=e))  # dann eben mit leerem Verlauf
 
 
 PASSAGE_SPLIT_AFTER = 8   # Sekunden; danach wird ein langer Satz an einem Komma geteilt
@@ -440,7 +550,7 @@ def _keep_original_audio(src, transcript_id):
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, AUDIO_DIR / name)
     except OSError as e:
-        print(f"  Audio konnte nicht aufbewahrt werden: {e}")  # dann eben ohne Player
+        print("  " + tr("audio_not_kept", error=e))  # dann eben ohne Player
         return None
     return name
 
@@ -464,7 +574,7 @@ def _compat_audio(path):
                 capture_output=True, text=True,
             )
             if r.returncode != 0:
-                print(f"  Umwandeln zum Abspielen fehlgeschlagen: {r.stderr.strip()[-300:]}")
+                print("  " + tr("compat_failed", error=r.stderr.strip()[-300:]))
                 tmp.unlink(missing_ok=True)
                 return None
             tmp.replace(target)
@@ -585,8 +695,20 @@ def _open_in_file_manager(folder):
         subprocess.run(["xdg-open", str(folder)])
 
 
+def _is_own_data_dir(folder):
+    """Schutz gegen ein falsch gesetztes TRANSCRIBE_DATA_DIR: nie das Home-Verzeichnis oder einen Ordner darüber leeren."""
+    folder, home = folder.resolve(), Path.home().resolve()
+    return folder != home and folder not in home.parents
+
+
 def _reset_app_data():
-    """Löscht alles im App-Datenordner: Transkripte, Verlauf, Modelle, Caches, Log."""
+    """Löscht alles im App-Datenordner: Transkripte, Verlauf, Modelle, Caches, Log.
+
+    Gibt False zurück, ohne etwas zu löschen, wenn der Ordner nicht nur der App gehören kann.
+    """
+    if not _is_own_data_dir(APP_DATA_DIR):
+        print("  " + tr("reset_refused", folder=APP_DATA_DIR))
+        return False
     with _jobs_lock:
         _jobs.clear()  # laufende Transkriptionen brechen beim nächsten Abschnitt ab
     with _history_lock:
@@ -595,7 +717,8 @@ def _reset_app_data():
                 shutil.rmtree(child, ignore_errors=True)
             else:
                 child.unlink(missing_ok=True)
-    print("  Alle App-Daten gelöscht")
+    print("  " + tr("reset_done"))
+    return True
 
 
 def _prune_jobs():
@@ -662,6 +785,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ],
                 "default_engine": next(iter(_engines)),
                 "languages": LANGUAGES,
+                "ui_language": UI_LANGUAGE,
                 "version": VERSION,
                 "app": APP_DATA_DIR is not None,
                 "output_dir": str(DEFAULT_OUTPUT_DIR).replace(str(Path.home()), "~", 1),
@@ -722,14 +846,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with _jobs_lock:
                     job = _jobs.get(job_id, {}).copy()
                 if not job:
-                    payload = {
-                        "type": "error",
-                        "gone": True,
-                        "message": "Job nicht gefunden – abgebrochen, abgelaufen oder Server neu gestartet.",
-                    }
+                    # abgebrochen, abgelaufen oder Server neu gestartet
+                    payload = {"type": "error", "error": "job_gone"}
                 elif job.get("done"):
                     if job.get("error"):
-                        payload = {"type": "error", "message": job["error"]}
+                        payload = {"type": "error", "error": job["error"], "detail": job["detail"]}
                     else:
                         # Der Job bleibt bestehen, bis die Seite das Ergebnis per DELETE /job
                         # bestätigt; so geht es nicht verloren, wenn die Verbindung abreißt.
@@ -784,8 +905,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if self.path == "/reset" and APP_DATA_DIR:
-            _reset_app_data()
-            self._json_response({"ok": True})
+            if _reset_app_data():
+                self._json_response({"ok": True})
+            else:
+                self._json_error("unsafe_data_dir", 500)
             return
 
         if self.path != "/transcribe":
@@ -795,14 +918,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         content_type = self.headers.get("Content-Type", "")
         if "boundary=" not in content_type:
-            self._json_response({"error": "Erwartet multipart/form-data."}, status=400)
+            self._json_error("bad_request", 400, "multipart/form-data")
             return
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             length = -1
         if length < 0:
-            self._json_response({"error": "Content-Length fehlt."}, status=411)
+            self._json_error("bad_request", 411, "Content-Length")
+            return
+        if length > MAX_UPLOAD:
+            self._json_error("too_large", 413, MAX_UPLOAD // 1024 ** 3)
             return
         body = self.rfile.read(length)
 
@@ -843,21 +969,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 output_folder = content.decode(errors="replace").strip()
 
         if not file_data:
-            self._json_response({"error": "Keine Datei empfangen."}, status=400)
+            self._json_error("no_file", 400)
             return
 
         if engine not in _engines:
-            self._json_response({"error": f"Engine nicht installiert. Verfügbar: {', '.join(_engines)}"}, status=400)
+            self._json_error("unknown_engine", 400, ", ".join(_engines))
             return
 
         models = ENGINES[engine]["models"]
         model_name = model_name or ENGINES[engine]["default_model"]
         if model_name not in models:
-            self._json_response({"error": f"Unbekanntes Modell. Erlaubt: {', '.join(models)}"}, status=400)
+            self._json_error("unknown_model", 400, ", ".join(models))
             return
 
         if language not in LANGUAGES:
-            self._json_response({"error": f"Unbekannte Sprache. Erlaubt: {', '.join(LANGUAGES)}"}, status=400)
+            self._json_error("unknown_language", 400, ", ".join(LANGUAGES))
             return
 
         if APP_DATA_DIR:
@@ -865,7 +991,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif output_folder:
             output_dir = Path(output_folder).expanduser()
             if not output_dir.is_dir():
-                self._json_response({"error": f"Ausgabeordner nicht gefunden: {output_folder}"})
+                self._json_error("folder_not_found", 400, output_folder)
                 return
             output_folder = str(output_dir)
 
@@ -885,6 +1011,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "file_name": file_name,
                 "result": None,
                 "error": None,
+                "detail": None,
             }
 
         threading.Thread(
@@ -937,6 +1064,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # der Browser bricht Ausschnitte oft ab, sobald er genug hat
 
+    def _json_error(self, error, status, detail=None):
+        """Fehler als Code; die Seite zeigt ihn in ihrer Sprache an (error_* in static/app.js)."""
+        self._json_response({"error": error, "detail": detail}, status=status)
+
     def _json_response(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -955,11 +1086,11 @@ def parse_port(value):
     try:
         port = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"'{value}' ist keine Zahl")
+        raise argparse.ArgumentTypeError(tr("not_a_number", value=value))
     if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("Port muss zwischen 1 und 65535 liegen")
+        raise argparse.ArgumentTypeError(tr("port_range"))
     if port in BROWSER_BLOCKED_PORTS:
-        raise argparse.ArgumentTypeError(f"Port {port} wird von Browsern blockiert")
+        raise argparse.ArgumentTypeError(tr("port_blocked", port=port))
     return port
 
 
@@ -998,12 +1129,12 @@ def ask_port(busy_port):
     """Bietet die nächsten freien Ports nach `busy_port` zur Auswahl an; eigene Eingabe ist auch möglich."""
     suggestions = find_free_ports(busy_port + 1)
     if suggestions:
-        print("  Freie Ports:")
+        print("  " + tr("free_ports"))
         for i, port in enumerate(suggestions, 1):
             print(f"    [{i}] {port}")
-        prompt = f"  Auswahl oder eigener Port (Enter = {suggestions[0]}): "
+        prompt = "  " + tr("choose_port", port=suggestions[0])
     else:
-        prompt = "  Anderen Port eingeben: "
+        prompt = "  " + tr("enter_port")
 
     while True:
         try:
@@ -1018,7 +1149,7 @@ def ask_port(busy_port):
         try:
             return parse_port(value)
         except argparse.ArgumentTypeError as e:
-            print(f"  Ungültige Eingabe: {e}")
+            print("  " + tr("invalid_input", error=e))
 
 
 def bind_server(port):
@@ -1051,53 +1182,57 @@ def create_server(port, interactive=True):
             return bind_server(port)
         except OSError as e:
             if e.errno not in (errno.EADDRINUSE, errno.EACCES):
-                print(f"  Server konnte nicht gestartet werden: {e}")
+                print("  " + tr("server_failed", error=e))
                 sys.exit(1)
-            print(f"  Port {port} ist nicht verfügbar ({e.strerror}).")
+            print("  " + tr("port_unavailable", port=port, reason=e.strerror))
             if not interactive:
                 free = find_free_ports(port + 1, count=1)
                 if not free:
-                    print("  Kein freier Port gefunden.")
+                    print("  " + tr("no_free_port"))
                     sys.exit(1)
                 port = free[0]
                 continue
             if not (sys.stdin and sys.stdin.isatty()):
-                print("  Mit --port einen anderen Port angeben.")
+                print("  " + tr("use_port_option"))
                 sys.exit(1)
             port = ask_port(port)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lokales Whisper Transkriptions-Tool")
+    parser = argparse.ArgumentParser(description=tr("description"))
     parser.add_argument(
         "-p", "--port", type=parse_port, default=DEFAULT_PORT,
-        help=f"Port für die Weboberfläche (Standard: {DEFAULT_PORT})",
+        help=tr("help_port", port=DEFAULT_PORT),
     )
     parser.add_argument(
         "--no-browser", action="store_true",
-        help="Browser beim Start nicht öffnen",
+        help=tr("help_no_browser"),
     )
     args = parser.parse_args()
 
     if not find_and_add_ffmpeg():
-        print("  Warnung: ffmpeg wurde nicht gefunden. Ohne ffmpeg schlägt die Transkription fehl.")
-        print("  Installation: brew install ffmpeg (macOS), winget install Gyan.FFmpeg (Windows),")
-        print("                sudo apt install ffmpeg (Linux)")
+        print("  " + tr("ffmpeg_missing"))
+        print("  " + tr("ffmpeg_install"))
+        print("    brew install ffmpeg          (macOS)")
+        print("    winget install Gyan.FFmpeg   (Windows)")
+        print("    sudo apt install ffmpeg      (Linux)")
 
     load_engines()
+    migrate_legacy_names()
 
     httpd = create_server(args.port)
     url = f"http://{HOST}:{httpd.server_address[1]}"
 
     print("=" * 50)
-    print("  Whisper Transkriptions-Tool")
+    print("  " + tr("description"))
     print("=" * 50)
-    print(f"  Server läuft auf {url}")
+    print("  " + tr("running_on", url=url))
     print(f"  Engines: {', '.join(ENGINES[name]['label'] for name in _engines)}")
     if not args.no_browser:
-        print("  Browser öffnet sich automatisch...")
-    stop_key = "Strg+C" if sys.platform == "win32" else "Ctrl+C"
-    print(f"  Zum Beenden: {stop_key}")
+        print("  " + tr("opening_browser"))
+    # Deutsche Windows-Tastaturen beschriften die Taste mit „Strg“
+    stop_key = "Strg+C" if sys.platform == "win32" and UI_LANGUAGE == "de" else "Ctrl+C"
+    print("  " + tr("stop_with", key=stop_key))
     print("=" * 50)
 
     threading.Thread(target=_prune_jobs_forever, daemon=True).start()
@@ -1108,7 +1243,7 @@ def main():
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\n  Server gestoppt.")
+            print("\n  " + tr("stopped"))
 
 
 if __name__ == "__main__":

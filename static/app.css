@@ -72,6 +72,36 @@ h1 {
   gap: 1rem;
 }
 
+/* Gruppen in den Einstellungen: Transkription, App */
+.panel-heading {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.panel-heading:not(:first-child) {
+  border-top: 1px solid var(--border);
+  padding-top: 1.25rem;
+  margin-top: 0.25rem;
+}
+
+/* Strich-Symbole (SVG) in Textfarbe */
+.icon {
+  display: block;
+  width: 1.25rem;
+  height: 1.25rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.icon-solid { fill: currentColor; stroke: none; }
+
 .drop-zone {
   border: 1px dashed var(--border);
   border-radius: var(--radius);
@@ -83,10 +113,12 @@ h1 {
   position: relative;
 }
 
-.drop-zone:hover, .drop-zone.dragover {
+.drop-zone:hover, .drop-zone.dragover, .drop-zone:has(input:focus-visible) {
   border-color: var(--accent);
   background: var(--surface-hover);
 }
+
+.drop-zone.dragover { border-style: solid; }
 
 .drop-zone input[type="file"] {
   position: absolute;
@@ -98,10 +130,18 @@ h1 {
 }
 
 .drop-icon {
-  font-size: 2rem;
-  margin-bottom: 1rem;
   display: block;
+  width: 2.25rem;
+  height: 2.25rem;
+  margin: 0 auto 1rem;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  transition: stroke 0.2s ease;
 }
+
+.drop-zone:hover .drop-icon, .drop-zone.dragover .drop-icon { stroke: var(--accent); }
 
 .drop-text {
   font-size: 0.9rem;
@@ -225,6 +265,18 @@ button, .button {
 button:hover, .button:hover { opacity: 0.85; }
 button:disabled { opacity: 0.3; cursor: not-allowed; }
 
+/* Grau statt blasser Akzentfarbe: klar erkennbar „noch nicht möglich“ */
+button:not(.ghost-btn):disabled {
+  opacity: 1;
+  background: var(--border);
+  color: var(--muted);
+}
+
+button:focus-visible, .player-track:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .ghost-btn {
   background: transparent;
   border: 1px solid var(--border);
@@ -245,10 +297,13 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
 }
 
 .icon-btn {
-  font-size: 1.1rem;
-  padding: 0.45rem 0.7rem;
-  line-height: 1;
-  letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
+  flex-shrink: 0;
 }
 
 .icon-btn[aria-expanded="true"] {
@@ -279,6 +334,7 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
   color: var(--muted);
   font-family: var(--mono);
   line-height: 1.5;
+  overflow-wrap: anywhere;  /* lange Ordnerpfade sonst breiter als das Fenster */
 }
 
 .hint.error { color: var(--danger); }
@@ -423,6 +479,7 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
 
 .card-text {
   font-size: 1rem;
+  font-weight: 400;  /* 300 ist hell auf dunklem Grund zu dünn für längere Texte */
   line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -463,20 +520,25 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
 }
 
 .play-btn {
-  width: 2.25rem;
-  height: 2.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
   padding: 0;
   border-radius: 50%;
   flex-shrink: 0;
-  letter-spacing: 0;
-  font-size: 0.8rem;
+  color: var(--text);
 }
+
+.play-btn .icon { width: 1.1rem; height: 1.1rem; }
 
 /* höhere Klickfläche als der sichtbare Balken */
 .player-track {
   flex: 1;
   padding: 0.6rem 0;
   cursor: pointer;
+  border-radius: 2px;
 }
 
 .player-bar {
@@ -484,7 +546,10 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
   background: var(--border);
   border-radius: 2px;
   overflow: hidden;
+  transition: height 0.15s;
 }
+
+.player-track:hover .player-bar { height: 6px; }
 
 .player-fill {
   height: 100%;
@@ -506,19 +571,20 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
   font-family: var(--mono);
   font-size: 0.7rem;
   color: var(--muted);
-  word-break: break-all;
+  overflow-wrap: anywhere;  /* lieber an Leerzeichen und / umbrechen als mitten im Wort */
 }
 
+/* Kopieren links, Löschen mit Abstand rechts, damit man sich nicht vertippt */
 .card-actions {
   display: flex;
+  justify-content: space-between;
   gap: 0.5rem;
   margin-top: 0.9rem;
 }
 
-.card-actions .copy { flex: 1; }
-
 @media (max-width: 560px) {
   .row { flex-direction: column; align-items: stretch; }
   .start-row button { padding: 0.9rem; }
+  .card-actions .copy { flex: 1; }
   .card-actions .ghost-btn { padding: 0.65rem 0.85rem; }
 }

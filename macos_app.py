@@ -55,10 +55,11 @@ def main():
     import transcribe
 
     transcribe.load_engines()
+    transcribe.migrate_legacy_names()
     # Fester Port, weil der Verlauf im localStorage am Origin hängt; nur wenn belegt ein anderer
     httpd = transcribe.create_server(transcribe.DEFAULT_PORT, interactive=False)
     url = f"http://{transcribe.HOST}:{httpd.server_address[1]}"
-    print(f"Transcribe {transcribe.VERSION} läuft auf {url}")
+    print(f"Transcribe {transcribe.VERSION}: " + transcribe.tr("running_on", url=url))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     threading.Thread(target=transcribe._prune_jobs_forever, daemon=True).start()
 

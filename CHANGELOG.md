@@ -2,6 +2,22 @@
 
 Changes to Transcribe, newest first. Each version matches a release tag `vX.Y.Z`; the release workflow copies the section of the tagged version into the GitHub release notes.
 
+## [Unreleased]
+
+### New
+- Transcribe is available in English and German. It follows the system language; you can switch it in the settings (⚙︎) under **App language**. Messages in the terminal and in the log file follow the system language too.
+
+### Changed
+- App data folders and files have English names: `Transkripte` is now `Transcripts`, and the history index `.verlauf.json` is now `.history.json`. Existing data is moved automatically on the first start.
+- The Mac app includes the license texts of all bundled components (`Transcribe.app/Contents/Resources/licenses`), and each release also provides the source code of the bundled FFmpeg.
+- Files larger than 2 GB are rejected instead of being read into memory.
+- Clearer interface: larger settings button and playback controls, settings grouped into *Transcription* and *App*, the speaker field is labeled *Who is speaking?*, and Copy and Delete sit apart on each card.
+- An audio file dropped anywhere in the window is picked up; before, the window opened the file itself and the app disappeared.
+- Keyboard: Escape closes the settings, and the arrow keys move the playback position.
+
+### Fixed
+- Long folder paths no longer make the page wider than the window.
+
 ## [1.1.0] – 2026-10-23
 
 ### New

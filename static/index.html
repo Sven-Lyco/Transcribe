@@ -1,87 +1,100 @@
 <!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="dark">
-<title>Whisper Transkription</title>
+<title>Transcribe</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎙️</text></svg>">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+<!-- Texte stehen in static/app.js (TEXTS); data-i18n* nennt den Schlüssel, der Inhalt hier ist die englische Fassung -->
 <div class="container">
   <header class="top">
     <div>
-      <h1>Whisper Transkription</h1>
-      <p class="subtitle">// lokal · kein API-Key · kein Internet</p>
+      <h1>Transcribe</h1>
+      <p class="subtitle" data-i18n="subtitle">// Whisper · local · no cloud</p>
     </div>
-    <button class="ghost-btn icon-btn" id="settingsBtn" aria-expanded="false" aria-controls="settings" title="Einstellungen" aria-label="Einstellungen">⚙︎</button>
+    <button class="ghost-btn icon-btn" id="settingsBtn" aria-expanded="false" aria-controls="settings" title="Settings" aria-label="Settings" data-i18n-label="settings">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19.34 10.03 L22.40 10.54 L22.40 13.46 L19.34 13.97 L18.58 15.80 L20.39 18.32 L18.32 20.39 L15.80 18.58 L13.97 19.34 L13.46 22.40 L10.54 22.40 L10.03 19.34 L8.20 18.58 L5.68 20.39 L3.61 18.32 L5.42 15.80 L4.66 13.97 L1.60 13.46 L1.60 10.54 L4.66 10.03 L5.42 8.20 L3.61 5.68 L5.68 3.61 L8.20 5.42 L10.03 4.66 L10.54 1.60 L13.46 1.60 L13.97 4.66 L15.80 5.42 L18.32 3.61 L20.39 5.68 L18.58 8.20Z"/><circle cx="12" cy="12" r="3.2"/></svg>
+    </button>
   </header>
 
   <section class="panel" id="settings" hidden>
+    <h2 class="panel-heading" data-i18n="settingsTranscription">Transcription</h2>
     <div class="field" id="engineField">
       <label for="engine">Engine</label>
       <select id="engine"></select>
     </div>
     <div class="row">
       <div class="field">
-        <label for="model">Modell</label>
+        <label for="model" data-i18n="model">Model</label>
         <select id="model"></select>
       </div>
       <div class="field">
-        <label for="language">Sprache</label>
+        <label for="language" data-i18n="spokenLanguage">Spoken language</label>
         <select id="language">
-          <option value="de">Deutsch</option>
-          <option value="en">English</option>
-          <option value="auto">Auto-detect</option>
+          <option value="de" data-i18n="language_de">German</option>
+          <option value="en" data-i18n="language_en">English</option>
+          <option value="auto" data-i18n="language_auto">Detect automatically</option>
         </select>
       </div>
     </div>
     <div class="hint" id="modelHint"></div>
     <div class="field" id="outputFolderField">
-      <label for="outputFolder">Ausgabeordner</label>
-      <input type="text" id="outputFolder" placeholder="Pfad zum Zielordner (leer = transcriptions/)">
+      <label for="outputFolder" data-i18n="outputFolder">Output folder</label>
+      <input type="text" id="outputFolder" placeholder="Path to the target folder (empty = transcriptions/)" data-i18n-placeholder="outputFolderPlaceholder">
+    </div>
+    <h2 class="panel-heading" data-i18n="settingsApp">App</h2>
+    <div class="field">
+      <label for="uiLanguage" data-i18n="appLanguage">App language</label>
+      <select id="uiLanguage">
+        <option value="auto" data-i18n="appLanguage_auto">Automatic (system)</option>
+        <option value="de">Deutsch</option>
+        <option value="en">English</option>
+      </select>
     </div>
     <div class="hint" id="dataHint"></div>
     <div class="row">
-      <button class="ghost-btn" id="openFolderBtn" type="button">Ordner öffnen</button>
-      <button class="ghost-btn danger" id="resetBtn" type="button" hidden>Alle App-Daten löschen …</button>
+      <button class="ghost-btn" id="openFolderBtn" type="button" data-i18n="openFolder">Open folder</button>
+      <button class="ghost-btn danger" id="resetBtn" type="button" hidden data-i18n="resetData">Delete all app data …</button>
     </div>
     <div class="hint" id="settingsMsg"></div>
   </section>
 
   <div class="drop-zone" id="dropZone">
     <input type="file" id="fileInput" accept="audio/*,.ogg,.mp3,.wav,.m4a,.opus,.webm">
-    <span class="drop-icon">🎙</span>
+    <svg class="drop-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/></svg>
     <div class="drop-text">
-      <span class="pointer-only"><strong>Audiodatei hierher ziehen</strong><br>oder klicken zum Auswählen</span>
-      <span class="touch-only"><strong>Audiodatei auswählen</strong></span>
+      <span class="pointer-only"><strong data-i18n="dropTitle">Drop an audio file here</strong><br><span data-i18n="dropHint">or click to choose one</span></span>
+      <span class="touch-only"><strong data-i18n="chooseFile">Choose an audio file</strong></span>
     </div>
     <div class="file-info" id="fileInfo"></div>
   </div>
 
   <div class="row start-row">
     <div class="field">
-      <label for="speakerName">Name (optional)</label>
-      <input type="text" id="speakerName" placeholder="z.B. Max Mustermann">
+      <label for="speakerName" data-i18n="speakerName">Who is speaking? (optional)</label>
+      <input type="text" id="speakerName" placeholder="e.g. Jane Doe" data-i18n-placeholder="speakerNamePlaceholder">
     </div>
-    <button id="startBtn" disabled>Starten</button>
+    <button id="startBtn" disabled data-i18n="start">Start</button>
   </div>
   <div class="summary" id="summary"></div>
 
   <div class="status failed offline" id="offline" role="alert" hidden>
-    <div class="progress">❌ Keine Verbindung zum Transcribe-Server</div>
-    <div class="status-detail">Der Verlauf ist eventuell nicht aktuell. Bitte Transcribe beenden und neu öffnen.</div>
+    <div class="progress">❌ <span data-i18n="offlineTitle">No connection to the Transcribe server</span></div>
+    <div class="status-detail" data-i18n="offlineDetail">The history may be out of date. Please quit Transcribe and open it again.</div>
   </div>
 
   <div class="jobs" id="jobs" aria-live="polite"></div>
 
   <section class="history">
     <div class="section-head">
-      <span class="section-label">Verlauf</span>
+      <span class="section-label" data-i18n="history">History</span>
       <span class="hint" id="historyCount"></span>
     </div>
-    <p class="empty" id="emptyState">Noch keine Transkripte.<br>Wähle oben eine Audiodatei aus.</p>
+    <p class="empty" id="emptyState"><span data-i18n="emptyTitle">No transcripts yet.</span><br><span data-i18n="emptyHint">Choose an audio file above.</span></p>
     <ol class="history-list" id="historyList"></ol>
   </section>
 
