@@ -1,11 +1,11 @@
 # Third-party software in Transcribe.app
 
-Transcribe itself is licensed under the MIT License (see `LICENSE`). The macOS app bundles the following third-party software:
+Transcribe itself is licensed under the MIT License (see `LICENSE`). The macOS app bundles the following third-party software. The full license texts are in the `licenses` folder inside the app (`Transcribe.app/Contents/Resources/licenses`).
 
 | Component | License | Source |
 |-----------|---------|--------|
 | Python | PSF License | https://www.python.org |
-| FFmpeg 8.1.3 (`ffmpeg`, `ffprobe`; audio decoders only, no GPL or non-free parts) | LGPL 2.1 or later | https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz, build flags in `packaging/macos/build_ffmpeg.sh` |
+| FFmpeg 8.1.3 (`ffmpeg`, `ffprobe`; audio decoders only, no GPL or non-free parts) | LGPL 2.1 or later | https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz, also attached to every release of Transcribe; build flags in `packaging/macos/build_ffmpeg.sh` |
 | MLX | MIT | https://github.com/ml-explore/mlx |
 | mlx-whisper | MIT | https://github.com/ml-explore/mlx-examples |
 | NumPy | BSD 3-Clause | https://numpy.org |

@@ -36,9 +36,10 @@ CONFIGURE_OPTIONS=(
 )
 
 PREFIX="$(mkdir -p "$1" && cd "$1" && pwd)"
-# Neu bauen, sobald sich Version oder Optionen ändern
+# Neu bauen, sobald sich Version oder Optionen ändern oder der Lizenztext fehlt (ältere Builds)
 BUILD_ID="$(echo "$FFMPEG_VERSION ${CONFIGURE_OPTIONS[*]}" | shasum -a 256 | cut -c1-16)"
-if [ -x "$PREFIX/bin/ffmpeg" ] && [ "$(cat "$PREFIX/.build-config" 2>/dev/null)" = "$BUILD_ID" ]; then
+if [ -x "$PREFIX/bin/ffmpeg" ] && [ -f "$PREFIX/COPYING.LGPLv2.1" ] \
+    && [ "$(cat "$PREFIX/.build-config" 2>/dev/null)" = "$BUILD_ID" ]; then
     echo "FFmpeg $FFMPEG_VERSION schon gebaut: $PREFIX/bin"
     exit 0
 fi
@@ -58,6 +59,8 @@ cd "$SRC_DIR/ffmpeg-$FFMPEG_VERSION"
 ./configure --prefix="$PREFIX" "${CONFIGURE_OPTIONS[@]}"
 make -j"$(sysctl -n hw.ncpu)"
 make install
+# Die LGPL verlangt den Lizenztext neben dem Programm (collect_licenses.py übernimmt ihn in die App)
+cp COPYING.LGPLv2.1 LICENSE.md "$PREFIX/"
 echo "$BUILD_ID" > "$PREFIX/.build-config"
 
 "$PREFIX/bin/ffmpeg" -hide_banner -version | head -1

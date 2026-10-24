@@ -1,0 +1,19 @@
+# Hält die auf Commits gepinnten GitHub Actions und die Abhängigkeiten der Mac-App aktuell:
+# Dependabot öffnet einmal im Monat je einen Pull Request mit den Updates.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: "/packaging/macos"
+    schedule:
+      interval: monthly
+    groups:
+      app-dependencies:
+        patterns: ["*"]

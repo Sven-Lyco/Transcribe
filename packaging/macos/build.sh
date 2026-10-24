@@ -44,6 +44,9 @@ echo "==> FFmpeg (nur Audio, LGPL)"
 $PKG/build_ffmpeg.sh "$BUILD/ffmpeg" > "$BUILD/ffmpeg-build.log" 2>&1 \
     || { tail -30 "$BUILD/ffmpeg-build.log"; exit 1; }
 
+echo "==> Lizenzen"
+"$VENV/bin/python" $PKG/collect_licenses.py "$BUILD/ffmpeg" "$BUILD/licenses"
+
 echo "==> Icon"
 "$VENV/bin/python" $PKG/make_icon.py "$BUILD/icon.icns"
 

@@ -12,6 +12,7 @@ datas = [
     (str(ROOT / "static"), "static"),
     (str(ROOT / "LICENSE"), "."),
     (str(Path(SPECPATH) / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(BUILD / "licenses"), "licenses"),  # aus collect_licenses.py
 ]
 # Eigenes Audio-FFmpeg aus build_ffmpeg.sh, macos_app.py legt den Ordner in den PATH
 binaries = [(str(BUILD / "ffmpeg" / "bin" / name), "bin") for name in ("ffmpeg", "ffprobe")]
