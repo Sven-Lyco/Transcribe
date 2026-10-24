@@ -22,14 +22,17 @@ import socketserver
 import json
 import locale
 import os
+import queue
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 import webbrowser
 import glob
@@ -80,6 +83,13 @@ JOB_TTL = 15 * 60  # Sekunden, die ein fertiges, nicht abgeholtes Ergebnis im Sp
 SOCKET_TIMEOUT = 60  # Sekunden ohne Datenfluss, bevor eine Verbindung aufgegeben wird
 MAX_FILE_NAME = 200
 MAX_UPLOAD = 2 * 1024 ** 3  # Bytes; der Upload wird komplett im Speicher gelesen (gut 3 Stunden WAV)
+MAX_TEXT = 10 * 1024 ** 2  # Bytes für einen bearbeiteten Text
+MAX_NOTIFY = 16 * 1024  # Bytes für Titel und Text einer Mitteilung
+
+# Update-Hinweis der Mac-App: einzige Verbindung ins Internet außer dem Modell-Download
+UPDATE_API = "https://api.github.com/repos/Sven-Lyco/Transcribe/releases/latest"
+RELEASES_URL = "https://github.com/Sven-Lyco/Transcribe/releases/"
+UPDATE_CACHE = 12 * 60 * 60  # Sekunden, die eine Antwort von GitHub gilt
 
 # In der Mac-App (PyInstaller) liegen die Dateien unter sys._MEIPASS
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -171,6 +181,10 @@ MESSAGES = {
     "reset_done": ("Alle App-Daten gelöscht", "All app data deleted"),
     "migrated": ("Daten früherer Versionen übernommen: {path}", "Moved data of an earlier version: {path}"),
     "migration_failed": ("Daten früherer Versionen nicht übernommen: {error}", "Could not move data of an earlier version: {error}"),
+    "opened_file": ("Geöffnet: {file}", "Opened: {file}"),
+    "notify_failed": ("Mitteilung nicht möglich: {error}", "Could not show a notification: {error}"),
+    "update_check_failed": ("Suche nach Updates fehlgeschlagen: {error}", "Checking for updates failed: {error}"),
+    "worker_failed": ("Fehler in der Warteschlange: {error}", "Error in the queue: {error}"),
     "not_a_number": ("'{value}' ist keine Zahl", "'{value}' is not a number"),
     "port_range": ("Port muss zwischen 1 und 65535 liegen", "The port must be between 1 and 65535"),
     "port_blocked": ("Port {port} wird von Browsern blockiert", "Browsers block port {port}"),
@@ -239,12 +253,26 @@ _engines: dict = {}
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+_job_seq = 0  # fortlaufende Nummer, ergibt den Platz in der Warteschlange
 _tqdm_local = threading.local()
+
+# Jobs laufen nacheinander in einem Thread, in der Reihenfolge der Uploads (_enqueue)
+_job_queue: queue.Queue = queue.Queue()
+_worker_lock = threading.Lock()
+_worker = None
 
 _history_lock = threading.Lock()
 
 _models: dict = {}  # zuletzt benutztes openai-whisper-Modell; mlx-whisper hält seins selbst
 _transcribe_lock = threading.Lock()  # immer nur eine Transkription, sonst bremsen sich die Jobs aus
+
+# Dateien, die die Mac-App per „Öffnen mit“ oder über das Dock bekommen hat (register_opened_files)
+_opened: dict = {}  # ID -> {"path", "name", "size"}
+_opened_new: list = []  # IDs, die die Seite noch nicht abgeholt hat
+_opened_lock = threading.Lock()
+
+notify_hook = None  # von der Mac-App gesetzt: notify_hook(title, body) zeigt eine Mitteilung von macOS
+_update_cache = None  # (Zeitpunkt, Antwort) der letzten Anfrage an GitHub
 
 
 class JobCancelled(Exception):
@@ -265,7 +293,76 @@ def _set_progress(job_id, pct):
     """
     with _jobs_lock:
         _raise_if_cancelled(job_id)
-        _jobs[job_id]["progress"] = max(0, min(99, int(pct)))
+        _jobs[job_id].update({"state": "running", "progress": max(0, min(99, int(pct)))})
+
+
+def _report_download(job_id, done, total):
+    """Meldet den Fortschritt eines Modell-Downloads in Bytes.
+
+    Bricht nicht ab: Das kommt teils aus den Download-Threads von huggingface_hub. Ein Abbruch
+    greift nach dem Download, und ein später neu gestartetes Laden macht dort weiter.
+    """
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update({"state": "downloading", "download": {"done": int(done), "total": int(total)}})
+
+
+def _download_progress_class(job_id):
+    """tqdm-Klasse für snapshot_download, die den Download an den Job meldet.
+
+    huggingface_hub fasst damit alle Dateien eines Modells in einem Byte-Balken („Reconstructing …“)
+    zusammen. Abgeleitet von tqdm selbst: Die Klasse von huggingface_hub schaltet sich ohne Terminal
+    ab (in der Mac-App gehen die Ausgaben ins Log) und zählt dann nicht mehr mit.
+    """
+    from tqdm.std import tqdm as std_tqdm
+
+    class DownloadProgress(std_tqdm):
+        def update(self, n=1):
+            result = super().update(n)
+            if self.unit == "B" and (self.desc or "").startswith("Reconstruct") and self.total:
+                _report_download(job_id, self.n, self.total)
+            return result
+
+    return DownloadProgress
+
+
+def _create_job(file_name):
+    """Legt einen wartenden Job an und gibt seine ID zurück."""
+    global _job_seq
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _job_seq += 1
+        _jobs[job_id] = {
+            "seq": _job_seq,
+            "state": "queued",
+            "progress": 0,
+            "done": False,
+            "finished_at": None,
+            "file_name": file_name,
+            "result": None,
+            "error": None,
+            "detail": None,
+        }
+    return job_id
+
+
+def _enqueue(args):
+    """Stellt einen Job hinten an; der Worker startet beim ersten Job."""
+    global _worker
+    with _worker_lock:
+        if _worker is None:
+            _worker = threading.Thread(target=_transcription_worker, daemon=True)
+            _worker.start()
+    _job_queue.put(args)
+
+
+def _transcription_worker():
+    while True:
+        args = _job_queue.get()
+        try:
+            _run_transcription(*args)
+        except Exception as e:  # _run_transcription fängt seine Fehler selbst ab; der Worker muss weiterlaufen
+            print("  " + tr("worker_failed", error=e))
 
 
 def load_engines():
@@ -310,10 +407,16 @@ def load_engines():
             result = super().update(n)
             job_id = getattr(_tqdm_local, "job_id", None)
             if job_id and self.total and self.total > 0:
-                _set_progress(job_id, self.n / self.total * 100)
+                if self.unit in ("B", "iB"):  # openai-whisper lädt ein Modell herunter
+                    _report_download(job_id, self.n, self.total)
+                else:
+                    _set_progress(job_id, self.n / self.total * 100)
             return result
 
     _tqdm_module.tqdm = _ProgressTqdm
+    if "openai" in _engines:
+        # openai-whisper hat tqdm für den Modell-Download schon beim Import übernommen
+        _engines["openai"].tqdm = _ProgressTqdm
 
 
 def _load_openai_model(model_name):
@@ -364,7 +467,7 @@ def _ensure_mlx_model(job_id, repo):
         _raise_if_cancelled(job_id)
         _jobs[job_id]["state"] = "downloading"
     print("  " + tr("downloading_model", model=repo))
-    snapshot_download(repo)
+    snapshot_download(repo, tqdm_class=_download_progress_class(job_id))
     with _jobs_lock:
         _raise_if_cancelled(job_id)
         _jobs[job_id]["state"] = "running"
@@ -662,6 +765,14 @@ def _list_history():
     return sorted(entries, key=lambda e: e["date"], reverse=True)
 
 
+def _file_entry_path(transcript_id):
+    """Pfad zu einer Verlaufs-ID der Form „file:<Name>.txt“, nur direkt im Standardordner; sonst None."""
+    name = transcript_id[len("file:"):] if transcript_id.startswith("file:") else ""
+    if not name or Path(name).name != name or not name.endswith(".txt"):
+        return None
+    return DEFAULT_OUTPUT_DIR / name
+
+
 def _delete_from_history(transcript_id):
     """Löscht das Transkript samt .txt-Datei. Gibt False zurück, wenn es nicht existiert."""
     with _history_lock:
@@ -671,18 +782,85 @@ def _delete_from_history(transcript_id):
             path = Path(meta["path"])
             _remove_audio(meta)
             _save_history_index(index)
-        elif transcript_id.startswith("file:"):
-            name = transcript_id[len("file:"):]
-            if Path(name).name != name or not name.endswith(".txt"):
-                return False  # nur Dateien direkt im Standardordner
-            path = DEFAULT_OUTPUT_DIR / name
         else:
-            return False
+            path = _file_entry_path(transcript_id)
+            if path is None:
+                return False
     try:
         path.unlink()
     except FileNotFoundError:
         pass
     return True
+
+
+def _update_transcript(transcript_id, text):
+    """Schreibt einen in der Seite bearbeiteten Text in die .txt. False, wenn es das Transkript nicht mehr gibt."""
+    with _history_lock:
+        meta = _load_history_index().get(transcript_id)
+        path = Path(meta["path"]) if meta else _file_entry_path(transcript_id)
+        if path is None or not path.is_file():
+            return False
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    return True
+
+
+def register_opened_files(paths):
+    """Nimmt Dateien an, die die Mac-App per „Öffnen mit“ oder über das Dock bekommen hat.
+
+    Die Seite holt sie über GET /opened ab und nennt beim Starten nur die ID. Ein Pfad kommt nie
+    über HTTP herein, sonst könnte jede lokale Anfrage beliebige Dateien transkribieren lassen.
+    """
+    with _opened_lock:
+        for path in map(Path, paths):
+            if not path.is_file():
+                continue
+            opened_id = uuid.uuid4().hex
+            _opened[opened_id] = {"path": str(path), "name": path.name[:MAX_FILE_NAME], "size": path.stat().st_size}
+            _opened_new.append(opened_id)
+            print("  " + tr("opened_file", file=path.name))
+
+
+def _take_opened():
+    """Neu geöffnete Dateien für die Seite, jede nur einmal."""
+    with _opened_lock:
+        items = [{"id": i, "name": _opened[i]["name"], "size": _opened[i]["size"]} for i in _opened_new]
+        _opened_new.clear()
+    return items
+
+
+def _version_tuple(version):
+    return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+
+
+def _is_newer(candidate, current):
+    return _version_tuple(candidate) > _version_tuple(current)
+
+
+def _check_for_update():
+    """Fragt GitHub nach der neuesten Version; die Antwort gilt UPDATE_CACHE Sekunden."""
+    global _update_cache
+    if _update_cache and time.time() - _update_cache[0] < UPDATE_CACHE:
+        return _update_cache[1]
+    try:
+        import certifi  # in der Mac-App findet Python die Zertifikate des Systems nicht von selbst
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        context = ssl.create_default_context()
+    request = urllib.request.Request(UPDATE_API, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"Transcribe/{VERSION}",
+    })
+    with urllib.request.urlopen(request, timeout=5, context=context) as response:
+        release = json.load(response)
+    latest = str(release.get("tag_name", "")).removeprefix("v")
+    url = str(release.get("html_url", ""))
+    if not url.startswith(RELEASES_URL):
+        url = RELEASES_URL + "latest"  # nur Links auf die eigenen Releases weitergeben
+    result = {"latest": latest, "url": url, "newer": bool(latest) and _is_newer(latest, VERSION)}
+    _update_cache = (time.time(), result)
+    return result
 
 
 def _open_in_file_manager(folder):
@@ -788,12 +966,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "ui_language": UI_LANGUAGE,
                 "version": VERSION,
                 "app": APP_DATA_DIR is not None,
+                "notify": notify_hook is not None,
                 "output_dir": str(DEFAULT_OUTPUT_DIR).replace(str(Path.home()), "~", 1),
             })
             return
 
         if parsed.path == "/transcripts":
             self._json_response(_list_history())
+            return
+
+        if parsed.path == "/opened":
+            self._json_response(_take_opened())
+            return
+
+        if parsed.path == "/update" and APP_DATA_DIR:
+            try:
+                self._json_response(_check_for_update())
+            except (OSError, ValueError) as e:  # offline, GitHub nicht erreichbar oder unerwartete Antwort
+                print("  " + tr("update_check_failed", error=e))
+                self._json_error("update_failed", 502)
             return
 
         if parsed.path == "/audio":
@@ -845,6 +1036,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             while True:
                 with _jobs_lock:
                     job = _jobs.get(job_id, {}).copy()
+                    # Jobs vor diesem in der Warteschlange, auch der gerade laufende
+                    ahead = sum(1 for j in _jobs.values() if not j["done"] and j["seq"] < job.get("seq", 0))
                 if not job:
                     # abgebrochen, abgelaufen oder Server neu gestartet
                     payload = {"type": "error", "error": "job_gone"}
@@ -862,6 +1055,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "value": job.get("progress", 0),
                         "file_name": job["file_name"],
                     }
+                    if job["state"] == "queued":
+                        payload["ahead"] = ahead
+                    elif job["state"] == "downloading" and job.get("download"):
+                        payload["download"] = job["download"]
                 self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
                 if payload["type"] != "progress":
@@ -894,6 +1091,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def do_PUT(self):
+        """Speichert einen in der Seite bearbeiteten Text in die .txt."""
+        if not self._is_local_request():
+            self.send_error(403)
+            return
+        parsed = urlparse(self.path)
+        if parsed.path != "/transcripts":
+            self.send_error(404)
+            return
+        data = self._read_json(MAX_TEXT)
+        if data is None:
+            return
+        if not isinstance(data.get("text"), str):
+            self._json_error("bad_request", 400, "text")
+            return
+        transcript_id = parse_qs(parsed.query).get("id", [""])[0]
+        self.send_response(204 if _update_transcript(transcript_id, data["text"]) else 404)
+        self.end_headers()
+
     def do_POST(self):
         if not self._is_local_request():
             self.send_error(403)
@@ -909,6 +1125,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json_response({"ok": True})
             else:
                 self._json_error("unsafe_data_dir", 500)
+            return
+
+        if self.path == "/notify" and notify_hook:
+            data = self._read_json(MAX_NOTIFY)
+            if data is None:
+                return
+            try:
+                notify_hook(str(data.get("title", ""))[:200], str(data.get("body", ""))[:500])
+            except Exception as e:  # eine Mitteilung darf nie die Seite stören
+                print("  " + tr("notify_failed", error=e))
+            self.send_response(204)
+            self.end_headers()
             return
 
         if self.path != "/transcribe":
@@ -943,6 +1171,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         language = "de"
         speaker_name = ""
         output_folder = ""
+        opened_id = ""
 
         for part in parts:
             if b"Content-Disposition" not in part:
@@ -967,6 +1196,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 speaker_name = content.decode(errors="replace").strip()[:MAX_FILE_NAME]
             elif 'name="output_folder"' in header_str:
                 output_folder = content.decode(errors="replace").strip()
+            elif 'name="opened"' in header_str:
+                opened_id = content.decode(errors="replace").strip()
+
+        if opened_id:
+            # Datei aus „Öffnen mit“: Die Seite nennt nur die ID, den Pfad kennt allein der Server
+            with _opened_lock:
+                opened = _opened.get(opened_id)
+            if opened and opened["size"] > MAX_UPLOAD:
+                self._json_error("too_large", 413, MAX_UPLOAD // 1024 ** 3)
+                return
+            try:
+                file_data = Path(opened["path"]).read_bytes() if opened else None
+            except OSError:
+                file_data = None
+            if file_data is None:
+                self._json_error("opened_gone", 400)
+                return
+            file_name = opened["name"]
 
         if not file_data:
             self._json_error("no_file", 400)
@@ -1001,25 +1248,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tmp_path = tmp.name
 
         _prune_jobs()
-        job_id = str(uuid.uuid4())
-        with _jobs_lock:
-            _jobs[job_id] = {
-                "state": "queued",
-                "progress": 0,
-                "done": False,
-                "finished_at": None,
-                "file_name": file_name,
-                "result": None,
-                "error": None,
-                "detail": None,
-            }
+        job_id = _create_job(file_name)
+        if opened_id:
+            with _opened_lock:
+                _opened.pop(opened_id, None)
 
-        threading.Thread(
-            target=_run_transcription,
-            args=(job_id, engine, model_name, tmp_path, language, speaker_name, output_folder, file_name),
-            daemon=True,
-        ).start()
-
+        _enqueue((job_id, engine, model_name, tmp_path, language, speaker_name, output_folder, file_name))
         self._json_response({"job_id": job_id})
 
     def _send_file(self, path, content_type):
@@ -1063,6 +1297,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass  # der Browser bricht Ausschnitte oft ab, sobald er genug hat
+
+    def _read_json(self, limit):
+        """Liest einen JSON-Objekt-Body bis `limit` Bytes. Bei Fehlern antwortet es selbst und gibt None zurück."""
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._json_error("bad_request", 411, "Content-Length")
+            return None
+        if length > limit:
+            self._json_error("bad_request", 413, "size")
+            return None
+        try:
+            data = json.loads(self.rfile.read(length))
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            self._json_error("bad_request", 400, "JSON")
+            return None
+        return data
 
     def _json_error(self, error, status, detail=None):
         """Fehler als Code; die Seite zeigt ihn in ihrer Sprache an (error_* in static/app.js)."""

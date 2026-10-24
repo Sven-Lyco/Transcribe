@@ -5,7 +5,10 @@ Aufruf im Projektordner: python3 -m unittest discover -s tests
 
 import argparse
 import http.client
+import importlib.util
+import io
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -13,6 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 import transcribe
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def word(text, start, end):
@@ -91,6 +96,54 @@ class LanguageTest(unittest.TestCase):
                 self.assertEqual(transcribe.tr("port_blocked", port=6000), expected)
 
 
+class QueueTest(unittest.TestCase):
+    def test_runs_jobs_in_upload_order(self):
+        started, finished = [], threading.Event()
+
+        def record(job_id):
+            started.append(job_id)
+            if len(started) == 3:
+                finished.set()
+
+        with mock.patch.object(transcribe, "_run_transcription", side_effect=record):
+            for n in range(3):
+                transcribe._enqueue((f"job{n}",))
+            self.assertTrue(finished.wait(5))
+        self.assertEqual(started, ["job0", "job1", "job2"])
+
+
+@unittest.skipUnless(importlib.util.find_spec("tqdm"), "braucht tqdm (z.B. in .venv)")
+class DownloadProgressTest(unittest.TestCase):
+    def test_reports_bytes_of_the_reconstruct_bar(self):
+        with mock.patch.dict(transcribe._jobs, clear=True):
+            job_id = transcribe._create_job("a.ogg")
+            progress = transcribe._download_progress_class(job_id)
+            files = progress(total=2, file=io.StringIO())  # Balken über die Anzahl der Dateien: zählt nicht
+            files.update(1)
+            self.assertNotIn("download", transcribe._jobs[job_id])
+            data = progress(total=0, unit="B", desc="Reconstructing (incomplete total...)", file=io.StringIO())
+            data.total = 3000  # huggingface_hub setzt die Summe nachträglich
+            data.update(1200)
+            self.assertEqual(transcribe._jobs[job_id]["download"], {"done": 1200, "total": 3000})
+
+
+class VersionTest(unittest.TestCase):
+    def test_is_newer(self):
+        cases = [("1.10.0", "1.9.0", True), ("1.2.0", "1.2.0", False), ("v2.0", "1.9.9", True), ("", "1.0.0", False)]
+        for candidate, current, expected in cases:
+            with self.subTest(candidate=candidate, current=current):
+                self.assertEqual(transcribe._is_newer(candidate, current), expected)
+
+
+class TextsTest(unittest.TestCase):
+    def test_both_languages_have_the_same_keys(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        blocks = re.search(r"\n  de: \{\n(.*?)\n  \},\n  en: \{\n(.*?)\n  \},\n\};", source, re.S)
+        de, en = ({m for m in re.findall(r"^    '?([\w-]+)'?:", block, re.M)} for block in blocks.groups())
+        self.assertGreater(len(de), 50)
+        self.assertEqual(de, en)
+
+
 class MigrationTest(unittest.TestCase):
     """Daten von Version 1.1.0: Ordner „Transkripte“ und Verlauf „.verlauf.json“."""
 
@@ -161,10 +214,22 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(transcribe, "AUDIO_DIR", self.audio_dir),
             mock.patch.object(transcribe, "APP_DATA_DIR", None),
             mock.patch.dict(transcribe._engines, {"openai": object()}),  # Platzhalter, wird nie aufgerufen
+            mock.patch.dict(transcribe._jobs, clear=True),
+            mock.patch.dict(transcribe._opened, clear=True),
+            mock.patch.object(transcribe, "_opened_new", []),
+            mock.patch.object(transcribe, "notify_hook", None),
+            mock.patch.object(transcribe, "_update_cache", None),
+            mock.patch("builtins.print"),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
+        # Statt zu transkribieren nur festhalten, was in die Warteschlange käme
+        self.enqueued = []
+        enqueue = mock.patch.object(transcribe, "_enqueue", side_effect=self.enqueued.append)
+        enqueue.start()
+        self.addCleanup(enqueue.stop)
+        self.addCleanup(lambda: [Path(args[3]).unlink(missing_ok=True) for args in self.enqueued])
 
         self.server = transcribe.Server((transcribe.HOST, 0), transcribe.Handler)
         self.port = self.server.server_address[1]
@@ -322,6 +387,140 @@ class ServerTest(unittest.TestCase):
     def test_reset_only_in_app(self):
         status, _, _ = self.request("POST", "/reset")
         self.assertEqual(status, 404)
+
+    def test_upload_goes_into_queue(self):
+        headers, body = self.multipart({"file": "ogg-daten", "model": "tiny", "speaker_name": "Anna"})
+        status, _, response = self.request("POST", "/transcribe", headers, body)
+        self.assertEqual(status, 200)
+        [(job_id, engine, model, tmp_path, language, speaker, _, file_name)] = self.enqueued
+        self.assertEqual(json.loads(response)["job_id"], job_id)
+        self.assertEqual((engine, model, language, speaker, file_name), ("openai", "tiny", "de", "Anna", "nachricht.ogg"))
+        self.assertEqual(Path(tmp_path).read_bytes(), b"ogg-daten")
+
+    # ---------- Fortschritt ----------
+
+    def first_event(self, job_id):
+        """Liest nur das erste Server-Sent Event; der Stream liefe sonst weiter, solange der Job wartet."""
+        conn = http.client.HTTPConnection(transcribe.HOST, self.port, timeout=5)
+        try:
+            conn.request("GET", f"/progress?job={job_id}", headers={"Host": f"127.0.0.1:{self.port}"})
+            response = conn.getresponse()
+            return json.loads(response.readline().decode().removeprefix("data: "))
+        finally:
+            conn.close()
+
+    def test_progress_shows_jobs_ahead(self):
+        first, second, third = (transcribe._create_job(f"{n}.ogg") for n in "abc")
+        transcribe._jobs[first]["state"] = "running"
+        self.assertEqual(self.first_event(third)["ahead"], 2)
+        self.assertEqual(self.first_event(second)["ahead"], 1)
+        self.assertNotIn("ahead", self.first_event(first))
+
+    def test_progress_shows_download(self):
+        job_id = transcribe._create_job("a.ogg")
+        transcribe._report_download(job_id, 512, 2048)
+        event = self.first_event(job_id)
+        self.assertEqual((event["state"], event["download"]), ("downloading", {"done": 512, "total": 2048}))
+
+    # ---------- Bearbeiten ----------
+
+    def put_text(self, transcript_id, text, headers=None):
+        body = json.dumps({"text": text}).encode()
+        return self.request("PUT", f"/transcripts?id={transcript_id}", {"Content-Type": "application/json", **(headers or {})}, body)[0]
+
+    def test_edit_saves_text(self):
+        txt = self.add_transcript()
+        self.assertEqual(self.put_text("abc", "Hallo, Welt!"), 204)
+        self.assertEqual(txt.read_text(encoding="utf-8"), "Hallo, Welt!")
+        (self.out / "alt.txt").write_text("alt", encoding="utf-8")
+        self.assertEqual(self.put_text("file:alt.txt", "neu"), 204)
+        self.assertEqual((self.out / "alt.txt").read_text(encoding="utf-8"), "neu")
+
+    def test_edit_rejects_invalid_requests(self):
+        self.add_transcript()
+        self.assertEqual(self.put_text("file:../abc.txt", "x"), 404)
+        self.assertEqual(self.put_text("gibtsnicht", "x"), 404)
+        self.assertEqual(self.put_text("abc", "x", {"Origin": "https://evil.example"}), 403)
+        status, _, _ = self.request("PUT", "/transcripts?id=abc", {"Content-Type": "application/json"}, b"[1, 2]")
+        self.assertEqual(status, 400)
+        status, _, _ = self.request("PUT", "/transcripts?id=abc", {"Content-Length": str(transcribe.MAX_TEXT + 1)}, b"")
+        self.assertEqual(status, 413)
+        self.assertEqual((self.out / "abc.txt").read_text(encoding="utf-8"), "Hallo Welt.")
+
+    # ---------- Geöffnete Dateien (Mac-App) ----------
+
+    def test_opened_files_are_listed_once(self):
+        audio = self.out / "Sprachnachricht.opus"
+        audio.write_bytes(b"opus-daten")
+        transcribe.register_opened_files([str(audio), str(self.out / "gibtsnicht.ogg")])
+        status, _, body = self.request("GET", "/opened")
+        [item] = json.loads(body)
+        self.assertEqual((status, item["name"], item["size"]), (200, "Sprachnachricht.opus", 10))
+        self.assertEqual(json.loads(self.request("GET", "/opened")[2]), [])
+
+        headers, body = self.multipart({"opened": item["id"]})
+        status, _, _ = self.request("POST", "/transcribe", headers, body)
+        self.assertEqual(status, 200)
+        [args] = self.enqueued
+        self.assertEqual(args[7], "Sprachnachricht.opus")
+        self.assertTrue(args[3].endswith(".opus"))
+        self.assertEqual(Path(args[3]).read_bytes(), b"opus-daten")
+        self.assertNotIn(item["id"], transcribe._opened)  # nur einmal verwendbar
+
+    def test_unknown_opened_file(self):
+        headers, body = self.multipart({"opened": "gibtsnicht"})
+        status, _, response = self.request("POST", "/transcribe", headers, body)
+        self.assertEqual((status, json.loads(response)["error"]), (400, "opened_gone"))
+        self.assertEqual(self.enqueued, [])
+
+    # ---------- Mitteilung (Mac-App) ----------
+
+    def test_notify_without_app(self):
+        status, _, _ = self.request("POST", "/notify", {"Content-Type": "application/json"}, b'{"title": "x"}')
+        self.assertEqual(status, 404)
+
+    def test_notify_calls_hook(self):
+        hook = mock.Mock()
+        with mock.patch.object(transcribe, "notify_hook", hook):
+            self.assertTrue(json.loads(self.request("GET", "/config")[2])["notify"])
+            body = json.dumps({"title": "Fertig", "body": "x" * 1000}).encode()
+            status, _, _ = self.request("POST", "/notify", {"Content-Type": "application/json"}, body)
+            hook.side_effect = RuntimeError("keine Erlaubnis")
+            status_after_error, _, _ = self.request("POST", "/notify", {"Content-Type": "application/json"}, body)
+        self.assertEqual((status, status_after_error), (204, 204))
+        hook.assert_called_with("Fertig", "x" * 500)
+
+    # ---------- Update-Hinweis (Mac-App) ----------
+
+    def github_answer(self, tag, url):
+        return io.BytesIO(json.dumps({"tag_name": tag, "html_url": url}).encode())
+
+    def test_update_only_in_app(self):
+        status, _, _ = self.request("GET", "/update")
+        self.assertEqual(status, 404)
+
+    def test_update_reports_newer_version(self):
+        release_url = transcribe.RELEASES_URL + "tag/v9.0.0"
+        with mock.patch.object(transcribe, "APP_DATA_DIR", self.out), \
+                mock.patch("urllib.request.urlopen", return_value=self.github_answer("v9.0.0", release_url)) as urlopen:
+            status, _, body = self.request("GET", "/update")
+            self.request("GET", "/update")  # zweite Anfrage aus dem Zwischenspeicher
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"latest": "9.0.0", "url": release_url, "newer": True})
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(urlopen.call_args.args[0].full_url, transcribe.UPDATE_API)
+
+    def test_update_keeps_only_own_release_links(self):
+        with mock.patch.object(transcribe, "APP_DATA_DIR", self.out), \
+                mock.patch("urllib.request.urlopen", return_value=self.github_answer(transcribe.VERSION, "https://evil.example/")):
+            answer = json.loads(self.request("GET", "/update")[2])
+        self.assertEqual(answer, {"latest": transcribe.VERSION, "url": transcribe.RELEASES_URL + "latest", "newer": False})
+
+    def test_update_offline(self):
+        with mock.patch.object(transcribe, "APP_DATA_DIR", self.out), \
+                mock.patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            status, _, body = self.request("GET", "/update")
+        self.assertEqual((status, json.loads(body)["error"]), (502, "update_failed"))
 
 
 if __name__ == "__main__":
