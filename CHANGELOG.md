@@ -2,7 +2,7 @@
 
 Changes to Transcribe, newest first. Each version matches a release tag `vX.Y.Z`; the release workflow copies the section of the tagged version into the GitHub release notes.
 
-## [Unreleased]
+## [1.2.0] – 2026-10-24
 
 ### New
 - Transcribe is available in English and German. It follows the system language; you can switch it in the settings (⚙︎) under **App language**. Messages in the terminal and in the log file follow the system language too.
